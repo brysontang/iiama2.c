@@ -1,0 +1,247 @@
+{
+ "model": "models/stories15M.bin",
+ "config": {
+  "dim": 288,
+  "hidden": 768,
+  "layers": 6,
+  "vocab": 32000,
+  "gs": 32
+ },
+ "reference": {
+  "stories": 6,
+  "positions": 1154
+ },
+ "classifier": {
+  "clamp8:16:0.5": {
+   "recall": {
+    "1": 0.9176776429809359,
+    "4": 0.9991334488734835,
+    "16": 1.0,
+    "64": 1.0
+   },
+   "nucleus_in_top64": 0.9776146131805158
+  },
+  "clamp8:8:0.7": {
+   "recall": {
+    "1": 0.9272097053726169,
+    "4": 0.9982668977469671,
+    "16": 1.0,
+    "64": 1.0
+   },
+   "nucleus_in_top64": 0.977256446991404
+  },
+  "exact11:8:1.0": {
+   "recall": {
+    "1": 0.9913344887348353,
+    "4": 1.0,
+    "16": 1.0,
+    "64": 1.0
+   },
+   "nucleus_in_top64": 0.9799426934097422
+  }
+ },
+ "variants": {
+  "f32": {
+   "top1": 1.0,
+   "kl": 0.0,
+   "ppl": 2.7681331826553475,
+   "positions": 1154,
+   "saturation": {},
+   "label": "fp32 CPU"
+  },
+  "q8": {
+   "top1": 0.9844020797227037,
+   "kl": 0.0004644122422979445,
+   "ppl": 2.7708682874632538,
+   "positions": 1154,
+   "saturation": {},
+   "label": "int8 CPU (the Wii today)"
+  },
+  "split:clamp8:16:0.5:64": {
+   "top1": 0.9844020797227037,
+   "kl": 0.0007556349995478734,
+   "ppl": 2.770752887671896,
+   "positions": 1154,
+   "saturation": {
+    "cls": 0.012291412418159061
+   },
+   "label": "split (clamp8/16 cols, headroom 0.5, CPU top-64)"
+  },
+  "split:exact11:8:1.0:64": {
+   "top1": 0.9844020797227037,
+   "kl": 0.0004759299472261851,
+   "ppl": 2.7710460316007626,
+   "positions": 1154,
+   "saturation": {
+    "cls": 0.0
+   },
+   "label": "split (exact11/8 cols, headroom 1.0, CPU top-64)"
+  },
+  "gpu:clamp8:16:0.5": {
+   "top1": 0.8734835355285961,
+   "kl": 0.06076140321512407,
+   "ppl": 2.971177449830116,
+   "positions": 1154,
+   "saturation": {
+    "wq": 0.0182471362357447,
+    "wk": 0.018209609089158484,
+    "wv": 0.01603899658372025,
+    "wo": 0.01728249076392009,
+    "w1": 0.018235612727202217,
+    "w2": 0.0047831231813124505,
+    "w3": 0.018021492774728802,
+    "cls": 0.012222280894954746
+   },
+   "label": "GPU only (clamp8/16 cols, headroom 0.5)"
+  },
+  "gpu:clamp8:8:0.7": {
+   "top1": 0.8708838821490468,
+   "kl": 0.08169605446938864,
+   "ppl": 3.0347505826546812,
+   "positions": 1154,
+   "saturation": {
+    "wq": 0.036450240062298966,
+    "wk": 0.036040199569755585,
+    "wv": 0.03394086635499355,
+    "wo": 0.03511039277410474,
+    "w1": 0.03673476694555438,
+    "w2": 0.01675035471093566,
+    "w3": 0.03651808215051779,
+    "cls": 0.025484138804640864
+   },
+   "label": "GPU only (clamp8/8 cols, headroom 0.7)"
+  },
+  "gpu:exact11:8:1.0": {
+   "top1": 0.9688041594454073,
+   "kl": 0.002205158756151043,
+   "ppl": 2.772576470216599,
+   "positions": 1154,
+   "saturation": {
+    "wq": 0.0,
+    "wk": 0.0,
+    "wv": 0.0,
+    "wo": 0.0,
+    "w1": 0.0,
+    "w2": 0.0,
+    "w3": 0.0,
+    "cls": 0.0
+   },
+   "label": "GPU only (exact11/8 cols, headroom 1.0)"
+  },
+  "gpu+rescore:exact11:8:1.0:64": {
+   "top1": 0.9714038128249567,
+   "kl": 0.0019356006243712316,
+   "ppl": 2.7721500394827556,
+   "positions": 1154,
+   "saturation": {
+    "wq": 0.0,
+    "wk": 0.0,
+    "wv": 0.0,
+    "wo": 0.0,
+    "w1": 0.0,
+    "w2": 0.0,
+    "w3": 0.0,
+    "cls": 0.0
+   },
+   "label": "GPU only (exact11/8 cols, headroom 1.0) + CPU top-64"
+  }
+ },
+ "greedy": {
+  "f32": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she had an idea. She would use a stick to knock the ball down.\nLily found a stick and tried to hit the ball. But the stick was",
+    "diverges_from_q8_at": null
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of food. Suddenly, he heard a loud noise. He looked up and saw a big bird flying above him. The bird was carrying a big bag of food.\nThe king was very angry. He shouted at the bird and said, \"That's my food! Give it back!\" The bird just flew away. The king was so angry that he started to cry.\nThe king's father came to the forest and saw the king crying. He asked the",
+    "diverges_from_q8_at": null
+   }
+  ],
+  "q8": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she had an idea. She would use a stick to get the ball down.\nLily found a long stick and tried to reach the ball. She poked",
+    "diverges_from_q8_at": null
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of food. Suddenly, he heard a loud noise. He looked up and saw a big bird flying above him. The bird was carrying a big bag of food.\nThe king was very angry. He shouted at the bird and said, \"That's my food! Give it back!\" The bird just flew away. The king was so angry that he started to cry.\nThe king's friend, a little rabbit, came to see what was wrong. The",
+    "diverges_from_q8_at": null
+   }
+  ],
+  "split:clamp8:16:0.5:64": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she had an idea. She would use a stick to get the ball down.\nLily found a long stick and tried to reach the ball. She poked",
+    "diverges_from_q8_at": null
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of food. Suddenly, he heard a loud noise. He looked up and saw a big bird flying above him. The bird was carrying a big bag of food.\nThe king was very angry. He shouted at the bird and said, \"That's my food! Give it back!\" The bird just flew away. The king was so angry that he started to cry.\nThe king's friend, a little rabbit, came to see what was wrong. The",
+    "diverges_from_q8_at": null
+   }
+  ],
+  "split:exact11:8:1.0:64": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she had an idea. She would use a stick to get the ball down.\nLily found a long stick and tried to reach the ball. She poked",
+    "diverges_from_q8_at": null
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of food. Suddenly, he heard a loud noise. He looked up and saw a big bird flying above him. The bird was carrying a big bag of food.\nThe king was very angry. He shouted at the bird and said, \"That's my food! Give it back!\" The bird just flew away. The king was so angry that he started to cry.\nThe king's friend, a little rabbit, came to see what was wrong. The",
+    "diverges_from_q8_at": null
+   }
+  ],
+  "gpu:clamp8:16:0.5": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. It looked like a big, fluffy pillow. Lily knew that meant it might rain soon.\nLily's mommy told her to come inside before it started to rain. Lily didn't want to go inside, but she knew her mommy was right. She went inside and watched the rain. It was wet outside, but she was happy to be inside.\n",
+    "diverges_from_q8_at": 34
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking along the beach. He was looking for something special. He saw a big, shiny rock and he decided to take it.\nThe king said, \"This rock is mine!\" He was so happy. He took the rock and put it in his pocket.\nThe king was so happy with his new rock. He said, \"This rock is mine now!\" He took the rock and went back to his castle.\nThe king was so happy with his new rock. He put it on the table and went to sleep. The next morning",
+    "diverges_from_q8_at": 11
+   }
+  ],
+  "gpu:clamp8:8:0.7": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the park. One day, she saw a big tree with lots of leaves. She wanted to climb the tree, but it was too tall.\nLily's friend, Timmy, came to the park too. He was very competitive and always wanted to win. He asked Lily if he could climb the tree too. Lily said yes and they both climbed the tree together.\nAfter they climbed the tree, they saw a bird's nest. The",
+    "diverges_from_q8_at": 22
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking through the forest. He was carrying a big sack full of treasures. He was carrying the sack, but he was carrying a big sack.\nThe turtle was very curious. He asked the king, \"What are you carrying in the sack?\"\nThe king smiled and said, \"I am carrying a sack of treasures. I am carrying it to the castle.\"\nThe turtle was very curious. He asked, \"What are you carrying?\"\nThe turtle said, \"I am",
+    "diverges_from_q8_at": 11
+   }
+  ],
+  "gpu:exact11:8:1.0": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump, but she couldn't reach it. She felt sad.\nThen, Lily had an idea. She found a big box and put it under the ball. She climbed on the box and reached up high.",
+    "diverges_from_q8_at": 76
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a little girl. She was playing in the sand and was making a sand castle. The king was so excited that he started to clap his hands.\nThe little girl was so happy that she started to clap too. She was so happy that she started to dance. The king was so surprised that he stopped clapping and started to laugh.\nThe little girl was so happy that she started to clap too. She kept on clapping and",
+    "diverges_from_q8_at": 11
+   }
+  ],
+  "gpu+rescore:exact11:8:1.0:64": [
+   {
+    "prompt": "Once upon a time",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she saw a big, strong man walking by. He was very reliable and always helped her when she needed it.\nLily asked the man if he could help",
+    "diverges_from_q8_at": 89
+   },
+   {
+    "prompt": "The grumpy turtle king",
+    "text": "The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a little girl. She was playing in the sand and was making a sand castle.\nThe king said to the little girl, \"What are you doing?\"\nThe little girl said, \"I'm making a castle!\"\nThe king said, \"That's very nice. Can I help you?\"\nThe little girl said, \"Yes, please!\"\nSo the king and the little girl worked together to make the castle. They used st",
+    "diverges_from_q8_at": 11
+   }
+  ]
+ }
+}

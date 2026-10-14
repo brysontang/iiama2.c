@@ -1,0 +1,20 @@
+.DS_Store
+
+# devkitPPC build output
+build/
+*.elf
+*.dol
+*.map
+
+# host test builds
+host/iiama2-host
+host/iiama2-host-ppc
+
+# models, tokenizers, and the exported SD card folder
+*.bin
+sd/
+
+__pycache__/
+
+# downloaded checkpoints
+models/

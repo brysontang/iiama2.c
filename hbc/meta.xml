@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>iiama2.c</name>
+  <coder>Bryson Tang</coder>
+  <version>0.1</version>
+  <short_description>A tiny language model on your Wii</short_description>
+  <long_description>Runs llama2.c-style TinyStories models on the Broadway CPU, or on the GPU. Put model.bin and tokenizer.bin in /llama/ on the SD card. A: tell a story, B: stop, +/-: CPU or GPU engine, HOME: exit.</long_description>
+</app>
