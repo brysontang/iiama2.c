@@ -203,3 +203,5 @@ Note that the default build sums each matmul row with 4 accumulators for speed, 
 ## License
 
 MIT, same as llama2.c. See [LICENSE](LICENSE).
+
+Not affiliated with or endorsed by Nintendo. Wii is a trademark of Nintendo.
