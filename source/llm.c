@@ -285,7 +285,7 @@ static void quantize_kv(const float *x, int n, int8_t *q, float *scale) {
     float s = amax / 127.0f, d = s == 0.0f ? 1.0f : s;
     *scale = s;
     for (int i = 0; i < n; i++) {
-        float r = rintf(x[i] / d);
+        float r = (x[i] / d + 12582912.0f) - 12582912.0f; // rintf for |r| < 2^22 (round half to even), no call
         q[i] = (int8_t)(r > 127.0f ? 127 : r < -127.0f ? -127 : r);
     }
 }
@@ -583,7 +583,8 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         }
         prof_lap(pf, LLM_PROF_KV_QUANT);
 
-        // multihead attention
+        // multihead attention (sqrtf is a software loop on the Wii, and errno keeps GCC from hoisting it)
+        float sqrt_hs = sqrtf(head_size);
         for (int h = 0; h < p->n_heads; h++) {
             int kh = h / kv_mul;
             float *q = m->q + h * head_size;
@@ -599,7 +600,7 @@ float *llm_forward(LlmModel *m, int token, int pos) {
                     const float *kk = m->key_cache + at;
                     for (int i = 0; i < head_size; i++) score += q[i] * kk[i];
                 }
-                score /= sqrtf(head_size);
+                score /= sqrt_hs;
                 att[t] = score;
             }
             prof_lap(pf, LLM_PROF_SCORES);
