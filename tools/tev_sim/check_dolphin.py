@@ -25,7 +25,7 @@ import sys
 
 import numpy as np
 from gxmatmul import BLEND, GPU, RESCORE_K, BlendMatrix, Split, TevMatrix
-from llama import Q8, Tokenizer, Weights, generate
+from llama import Q8, Tokenizer, Weights, fast_exp, generate
 
 # must match ENGINES in source/main.c
 ENGINES = [
@@ -54,6 +54,11 @@ def selftest(W):
             m = TevMatrix(W.f32[key], mode, headroom, cols, row_scales=mode == "clamp8")
             partial, _ = m.tev_partials(x[: m.n])
             out[(mode, name)] = f"{fnv1a_partials(partial):08x}"
+    # llm.c's exp over x = -100 .. 100 in steps of 1/128, each float's bits low byte first (llm_check_exp)
+    h = 2166136261
+    for byte in fast_exp(np.arange(-12800, 12800, dtype=np.float32) / np.float32(128)).astype("<f4").tobytes():
+        h = ((h ^ byte) * 16777619) & 0xFFFFFFFF
+    out[("exp", "fn")] = f"{h:08x}"
     return out
 
 

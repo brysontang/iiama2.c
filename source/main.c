@@ -357,6 +357,7 @@ static void print_profile(unsigned long gen_ms) {
 static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
     char path[64];
     int steps = 64, poweroff = 0;
+    float temp = 0.0f; // "temp X": after the greedy runs, every engine again sampling at X (top-p 0.9, seed 1)
     snprintf(path, sizeof(path), "%s/llama/bench.txt", root);
     FILE *f = fopen(path, "r");
     if (f) {
@@ -364,6 +365,7 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         while (fgets(line, sizeof(line), f)) {
             if (strncmp(line, "poweroff", 8) == 0) poweroff = 1;
             if (strncmp(line, "steps ", 6) == 0) steps = atoi(line + 6);
+            if (sscanf(line, "temp %f", &temp) == 1 && (temp < 0.0f || temp > 1.5f)) temp = 0.0f;
         }
         fclose(f);
     }
@@ -395,11 +397,14 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         if (gxm_tokens_failed()) report("warning: GPU draw-sync tokens timed out; matmuls fell back to GX_DrawDone\n");
         free(x);
     }
+    report("selftest exp: fn %08lx\n", (unsigned long)llm_check_exp());
     int ps_total, ps_bad = llm_check_paired_singles(m, &ps_total);
     if (ps_total) report("paired singles: %d of %d int8 matmul and attention outputs differ from the scalar loops\n", ps_bad, ps_total);
 
     LlmSampler s;
-    for (int e = 0; e < N_ENGINES; e++) {
+    for (int run = 0; run < N_ENGINES * (temp > 0.0f ? 2 : 1); run++) {
+        int e = run % N_ENGINES;
+        float tp = run < N_ENGINES ? 0.0f : temp;
         if (!engine_ok(e)) continue;
         apply_engine(m, e);
         gxm_reset_stats();
@@ -408,13 +413,15 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         m->prof = &g_prof;
         g_story_len = 0;
         g_story[0] = '\0';
-        if (llm_init_sampler(&s, m->c.vocab_size, 0.0f, 0.9f, 1)) break;
+        if (llm_init_sampler(&s, m->c.vocab_size, tp, 0.9f, 1)) break;
         unsigned long ms = 0;
         unsigned long t0 = clock_ms();
         int pos = llm_generate(m, t, &s, PROMPTS[0], steps, bench_token, NULL, clock_ms, &ms);
         unsigned long total = clock_ms() - t0;
         llm_free_sampler(&s);
-        report("\n[%s] %d tokens, %lu ms total, %.2f tok/s after the first token\n", ENGINES[e].name, pos, total,
+        char name[64];
+        snprintf(name, sizeof(name), tp > 0.0f ? "%s, temperature %.1f" : "%s", ENGINES[e].name, tp);
+        report("\n[%s] %d tokens, %lu ms total, %.2f tok/s after the first token\n", name, pos, total,
                pos > 1 && ms > 0 ? (pos - 1) * 1000.0 / ms : 0.0);
         print_gpu_stats(report);
         print_profile(ms);

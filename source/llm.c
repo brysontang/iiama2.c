@@ -585,13 +585,59 @@ static void rmsnorm(float *o, const float *x, const float *weight, int size) {
     for (int j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
 }
 
+// Separately rounded float operations, no fused multiply-adds: GCC takes an attribute, clang a pragma.
+#ifdef __clang__
+#define NO_FMA
+#define NO_FMA_BODY _Pragma("STDC FP_CONTRACT OFF")
+#else
+#define NO_FMA __attribute__((optimize("fp-contract=off")))
+#define NO_FMA_BODY
+#endif
+
+// e^x from float adds and multiplies only, so it gives the same floats on the Wii, on a desktop and in
+// tools/tev_sim/llama.py (fast_exp), which copies it operation for operation. newlib's expf costs about
+// 150 cycles a call on the Wii. Cody-Waite reduction x = n ln2 + r, |r| <= ln2/2, then Cephes expf's
+// polynomial for e^r (about 1 ulp), times 2^n built from its exponent bits.
+NO_FMA static float exp_f(float x) {
+    NO_FMA_BODY
+    if (x < -87.0f) return 0.0f; // e^-87 is just above FLT_MIN, so no denormals below
+    if (x > 88.0f) return INFINITY;
+    float n = (x * 1.44269504f + 12582912.0f) - 12582912.0f; // x / ln2, rounded to nearest even
+    float r = x - n * 0.693359375f;                          // ln2 in two parts; this product is exact
+    r = r - n * -2.12194440e-4f;
+    float p = 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    float y = p * (r * r) + r + 1.0f;
+    union { uint32_t u; float f; } scale = {(uint32_t)((int)n + 127) << 23};
+    return y * scale.f;
+}
+
+uint32_t llm_check_exp(void) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 25600; i++) { // x = -100 .. 100 in steps of 1/128, every one exact
+        union { float f; uint32_t u; } y = {exp_f((float)(i - 12800) / 128.0f)};
+        for (int b = 0; b < 32; b += 8) h = (h ^ ((y.u >> b) & 0xff)) * 16777619u;
+    }
+    return h;
+}
+
+#ifdef LLM_EXACT_MATMUL
+#define EXPF expf // upstream llama2.c's floats
+#else
+#define EXPF exp_f
+#endif
+
 static void softmax(float *x, int size) {
     float max_val = x[0];
     for (int i = 1; i < size; i++)
         if (x[i] > max_val) max_val = x[i];
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
+        x[i] = EXPF(x[i] - max_val);
         sum += x[i];
     }
     for (int i = 0; i < size; i++) x[i] /= sum;
@@ -759,7 +805,7 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         prof_lap(pf, LLM_PROF_W1W3);
         for (int i = 0; i < hidden_dim; i++) {
             float val = m->hb[i];
-            val *= (1.0f / (1.0f + expf(-val)));
+            val *= (1.0f / (1.0f + EXPF(-val)));
             val *= m->hb2[i];
             m->hb[i] = val;
         }

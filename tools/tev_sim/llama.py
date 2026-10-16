@@ -81,9 +81,30 @@ def rmsnorm(x, w):
     return w * (x / np.sqrt(ss))
 
 
+def fast_exp(x):
+    """
+    llm.c's exp_f, operation for operation in float32 (numpy never fuses a multiply-add): Cody-Waite range
+    reduction, Cephes expf's polynomial, and 2^n from exponent bits. Returns the same floats as the C.
+    """
+    f = np.float32
+    x = np.asarray(x, np.float32)
+    xc = np.clip(x, f(-87), f(88))
+    n = (xc * f(1.44269504) + f(12582912)) - f(12582912)
+    r = xc - n * f(0.693359375)
+    r = r - n * f(-2.12194440e-4)
+    p = np.full_like(r, f(1.9875691500e-4))
+    for c in (1.3981999507e-3, 8.3334519073e-3, 4.1665795894e-2, 1.6666665459e-1, 5.0000001201e-1):
+        p = p * r + f(c)
+    y = p * (r * r) + r + f(1)
+    y = y * ((n.astype(np.int32) + 127) << 23).view(np.float32)
+    return np.where(x < f(-87), f(0), np.where(x > f(88), f(np.inf), y)).astype(np.float32)
+
+
 def softmax(x):
-    e = np.exp(x - x.max())
-    return e / e.sum()
+    """llm.c's softmax: exp_f, a running float32 sum, then a divide."""
+    x = np.asarray(x, np.float32)
+    e = fast_exp(x - x.max())
+    return e / np.cumsum(e, dtype=np.float32)[-1]
 
 
 def quantize_kv(v, hs):
@@ -143,14 +164,14 @@ class Transformer:
                 scores = K @ q[h * hs:(h + 1) * hs]
                 if self.kv8:
                     scores = scores * self.k_scale[l, : pos + 1, kh]
-                att = softmax(scores / np.sqrt(hs))
+                att = softmax(scores / np.float32(np.sqrt(hs)))
                 if self.kv8:
                     att = att * self.v_scale[l, : pos + 1, kh]
                 out[h * hs:(h + 1) * hs] = att @ V
             x = x + mm(("wo", l), out)
             xb = rmsnorm(x, W.rms_ffn[l])
             h1, h3 = mm(("w1", l), xb), mm(("w3", l), xb)
-            x = x + mm(("w2", l), (h1 / (1.0 + np.exp(-h1))) * h3)
+            x = x + mm(("w2", l), (h1 * (np.float32(1) / (np.float32(1) + fast_exp(-h1)))) * h3)  # llm.c's order
         x = rmsnorm(x, W.rms_final)
         return mm("cls", x)
 

@@ -3,6 +3,7 @@
 #
 #   tools/dolphin_bench.sh sd/llama          # folder with model.bin + tokenizer.bin
 #   tools/dolphin_bench.sh sd/llama 32       # tokens per engine (default 64)
+#   TEMP=0.8 tools/dolphin_bench.sh sd/llama # then every engine again, sampling at that temperature
 #   PROBE=1 tools/dolphin_bench.sh sd/llama  # GPU and DSP probes instead (gx_probe.c, dsp_probe.c);
 #                                            # keeps probe.bin and probe_out.txt
 #
@@ -29,6 +30,7 @@ SD="$WORK/sd.raw"
 MODE_FILE=bench.txt
 [ -n "${PROBE:-}" ] && MODE_FILE=probe.txt
 printf 'poweroff\nsteps %s\n' "$STEPS" > "$WORK/$MODE_FILE"
+[ -n "${TEMP:-}" ] && printf 'temp %s\n' "$TEMP" >> "$WORK/$MODE_FILE"
 DSP_CORE= DSP_JIT= DSP_LOG=
 if [ -n "${PROBE:-}" ]; then
     DSP_CORE="DSPHLE = False"

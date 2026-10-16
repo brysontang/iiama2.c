@@ -154,6 +154,8 @@ float *llm_forward(LlmModel *m, int token, int pos);
 // On the Wii, int8 matmuls and attention use paired singles. Compares them with the scalar loops:
 // returns how many output floats differ in any bit (0 expected), and how many were compared in *total.
 int llm_check_paired_singles(const LlmModel *m, int *total);
+// FNV-1a of llm.c's exp over x = -100 .. 100 in steps of 1/128: check_dolphin.py compares it with the simulator.
+uint32_t llm_check_exp(void);
 int llm_encode(LlmTokenizer *t, const char *text, int bos, int eos, int *tokens, int *n_tokens);
 const char *llm_decode(LlmTokenizer *t, int prev_token, int token);
 int llm_sample(LlmSampler *s, float *logits);
