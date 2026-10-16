@@ -18,6 +18,11 @@
  * Data memory: four 1K-word banks. Dual loads ('LD) must read two different banks (on the same bank
  * both registers get the first address's word), so x lives in bank 1 and the weights in banks 2-3.
  *
+ * The stacks are shallower than Dolphin's (which holds 32 of everything), and BLOOP and LOOP push the
+ * call stack too: on a Wii, 3 nested loops under one call work, while a call inside a loop inside a
+ * loop inside a call failed. So no kernel goes deeper than one call and three loops; the stack tests in
+ * op 7 measure the real limits.
+ *
  * SI only stores to hardware registers: on a real DSP it writes 0xFF00 | M, whatever M is (Dolphin's
  * interpreter sign-extends M, so there it can also write data memory 0x0000-0x007F; the first version of
  * this microcode relied on that and jumped to 0 on a Wii). Data memory is written with SR/SRRI.
@@ -78,6 +83,7 @@ V_EXC:		equ	0x0028	/* set while an exception is being reported */
 V_OPN:		equ	0x0029	/* the current command's op and N1, for exception reports */
 V_TST:		equ	0x002a
 V_SCR:		equ	0x0030	/* scratch word for the SI test */
+T_CNT:		equ	0x0040	/* the stack tests' 20 counters */
 T_D0:		equ	0x0080	/* the tests' data: 64 words here, at XBUF and at BUF0 */
 OUTBUF:		equ	0x0100	/* results, flushed to main memory by DMA (bank 0) */
 XBUF:		equ	0x0400	/* activations or per-pass scales (bank 1) */
@@ -709,55 +715,71 @@ rb_compute:
 	lri	$acc0.m, #0x8000	/* XORC flips the top bit: 256 * byte -> 256 * (byte - 128) */
 	bloop	$acx0.l, rb_tile_end
 	bloopi	#16, rb_px_end
+	/* R: the low byte of the AR words */
 	mrr	$ar0, $ar1
-	call	rb_lo			/* R: low byte of AR */
-	mrr	$ar0, $ar1
-	addarn	$ar0, $ix1
-	call	rb_hi			/* G: high byte of GB */
-	mrr	$ar0, $ar1
-	addarn	$ar0, $ix1
-	call	rb_lo			/* B: low byte of GB */
-rb_px_end:
-	iar	$ar1
-	addarn	$ar1, $ix1		/* past the tile's GB half */
-rb_tile_end:
-	nop
-	s16
-	ret
-
-/* One channel of one pixel: N1 words from $ar0 on, N6 apart, times the scales at XBUF. */
-rb_lo:
 	lri	$ar3, #XBUF
 	mrr	$acx0.h, $acx1.l
 	cw	0x847c			/* clrp'ln : $ac1.m, @$ar0 */
-	bloop	$ix2, rbl_end
+	bloop	$ix2, rbr_end
 	cw	0x35db			/* lsrnrx'l $acc1, $ax0.h : $ax1.h, @$ar3 */
 	xorc	$acc1.m, $acc0.m
-rbl_end:
+rbr_end:
 	cw	0xeb7c			/* maddc'ln $ac1.m, $ax1.h : $ac1.m, @$ar0 */
 	cw	0x35db			/* lsrnrx'l $acc1, $ax0.h : $ax1.h, @$ar3 */
 	xorc	$acc1.m, $acc0.m
 	cw	0xeb00			/* maddc $ac1.m, $ax1.h */
-	jmp	rb_store
-rb_hi:
-	lri	$ar3, #XBUF
-	mrr	$acx0.h, $ix3
-	cw	0x847c			/* clrp'ln : $ac1.m, @$ar0 */
-	bloop	$ix2, rbh_end
-	cw	0x355b			/* andr'l $ac1.m, $ax0.h : $ax1.h, @$ar3 */
-	xorc	$acc1.m, $acc0.m
-rbh_end:
-	cw	0xeb7c			/* maddc'ln $ac1.m, $ax1.h : $ac1.m, @$ar0 */
-	cw	0x355b			/* andr'l $ac1.m, $ax0.h : $ax1.h, @$ar3 */
-	xorc	$acc1.m, $acc0.m
-	cw	0xeb00			/* maddc $ac1.m, $ax1.h */
-rb_store:
 	movp	$acc1
 	cw	0x15f8			/* asr $acc1, #-8: the sum is a multiple of 256 */
 	s16
 	srri	@$ar2, $acc1.m
 	srri	@$ar2, $acc1.l
 	s40
+	/* G: the high byte of the GB words */
+	mrr	$ar0, $ar1
+	addarn	$ar0, $ix1
+	lri	$ar3, #XBUF
+	mrr	$acx0.h, $ix3
+	cw	0x847c			/* clrp'ln : $ac1.m, @$ar0 */
+	bloop	$ix2, rbg_end
+	cw	0x355b			/* andr'l $ac1.m, $ax0.h : $ax1.h, @$ar3 */
+	xorc	$acc1.m, $acc0.m
+rbg_end:
+	cw	0xeb7c			/* maddc'ln $ac1.m, $ax1.h : $ac1.m, @$ar0 */
+	cw	0x355b			/* andr'l $ac1.m, $ax0.h : $ax1.h, @$ar3 */
+	xorc	$acc1.m, $acc0.m
+	cw	0xeb00			/* maddc $ac1.m, $ax1.h */
+	movp	$acc1
+	cw	0x15f8			/* asr $acc1, #-8 */
+	s16
+	srri	@$ar2, $acc1.m
+	srri	@$ar2, $acc1.l
+	s40
+	/* B: the low byte of the GB words */
+	mrr	$ar0, $ar1
+	addarn	$ar0, $ix1
+	lri	$ar3, #XBUF
+	mrr	$acx0.h, $acx1.l
+	cw	0x847c			/* clrp'ln : $ac1.m, @$ar0 */
+	bloop	$ix2, rbb_end
+	cw	0x35db			/* lsrnrx'l $acc1, $ax0.h : $ax1.h, @$ar3 */
+	xorc	$acc1.m, $acc0.m
+rbb_end:
+	cw	0xeb7c			/* maddc'ln $ac1.m, $ax1.h : $ac1.m, @$ar0 */
+	cw	0x35db			/* lsrnrx'l $acc1, $ax0.h : $ax1.h, @$ar3 */
+	xorc	$acc1.m, $acc0.m
+	cw	0xeb00			/* maddc $ac1.m, $ax1.h */
+	movp	$acc1
+	cw	0x15f8			/* asr $acc1, #-8 */
+	s16
+	srri	@$ar2, $acc1.m
+	srri	@$ar2, $acc1.l
+	s40
+rb_px_end:
+	iar	$ar1
+	addarn	$ar1, $ix1		/* past the tile's GB half */
+rb_tile_end:
+	nop
+	s16
 	ret
 
 /* ---- op 7: instruction tests, one per command, to find what a real DSP does differently from Dolphin.
@@ -819,6 +841,56 @@ op_test:
 	jeq	t_rbc
 	cmpi	$acc0.m, #17
 	jeq	t_acc
+	cmpi	$acc0.m, #18
+	jeq	t_sk0
+	cmpi	$acc0.m, #19
+	jeq	t_sk1
+	cmpi	$acc0.m, #20
+	jeq	t_sk2
+	cmpi	$acc0.m, #21
+	jeq	t_sk3
+	cmpi	$acc0.m, #22
+	jeq	t_rbnew
+	cmpi	$acc0.m, #23
+	jeq	t_b1
+	cmpi	$acc0.m, #24
+	jeq	t_b2
+	cmpi	$acc0.m, #25
+	jeq	t_b3
+	cmpi	$acc0.m, #26
+	jeq	t_calls
+	cmpi	$acc0.m, #27
+	jeq	t_calls
+	cmpi	$acc0.m, #28
+	jeq	t_calls
+	cmpi	$acc0.m, #29
+	jeq	t_calls
+	cmpi	$acc0.m, #30
+	jeq	t_b3l
+	cmpi	$acc0.m, #31
+	jeq	t_b4
+	cmpi	$acc0.m, #32
+	jeq	t_calls
+	cmpi	$acc0.m, #33
+	jeq	t_calls
+	cmpi	$acc0.m, #34
+	jeq	t_calls
+	cmpi	$acc0.m, #35
+	jeq	t_calls
+	cmpi	$acc0.m, #36
+	jeq	t_calls
+	cmpi	$acc0.m, #37
+	jeq	t_rbold
+	cmpi	$acc0.m, #38
+	jeq	t_b5
+	cmpi	$acc0.m, #39
+	jeq	t_b4l
+	cmpi	$acc0.m, #40
+	jeq	t_ie
+	cmpi	$acc0.m, #41
+	jeq	t_cl1
+	cmpi	$acc0.m, #42
+	jeq	t_cl2
 t_end:
 	lri	$status, #0x2000
 	lr	$acx0.h, @P_CH
@@ -1190,3 +1262,620 @@ t_acc:
 	srri	@$ar2, $ar0
 	srri	@$ar2, $ar3
 	jmp	t_end
+
+/* ---- stack tests (op 7, 18-40). Counters C0-C19 at T_CNT; every loop body counts its passes. ---- */
+C0:	equ	0x0040
+C1:	equ	0x0041
+C2:	equ	0x0042
+C3:	equ	0x0043
+C4:	equ	0x0044
+C5:	equ	0x0045
+C6:	equ	0x0046
+C7:	equ	0x0047
+C8:	equ	0x0048
+C10:	equ	0x004a
+C11:	equ	0x004b
+C12:	equ	0x004c
+C13:	equ	0x004d
+C14:	equ	0x004e
+C15:	equ	0x004f
+C16:	equ	0x0050
+C17:	equ	0x0051
+C18:	equ	0x0052
+
+t_cclr:
+	lri	$ar0, #T_CNT
+	lri	$acx0.l, #0
+	loopi	#20
+	srri	@$ar0, $acx0.l
+	ret
+
+t_cst:
+	lri	$ar0, #T_CNT
+	bloopi	#20, tcst_e
+	lrri	$acx0.l, @$ar0
+tcst_e:
+	srri	@$ar2, $acx0.l
+	ret
+
+/* 18-21: push values straight onto one stack, then pop them all: how deep each stack really is */
+t_sk0:
+	lri	$ar0, #0x1000
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	jmp	t_end
+
+t_sk1:
+	lri	$ar0, #0x1100
+	mrr	$st1, $ar0
+	iar	$ar0
+	mrr	$st1, $ar0
+	iar	$ar0
+	mrr	$st1, $ar0
+	iar	$ar0
+	mrr	$st1, $ar0
+	iar	$ar0
+	mrr	$st1, $ar0
+	iar	$ar0
+	mrr	$st1, $ar0
+	srri	@$ar2, $st1
+	srri	@$ar2, $st1
+	srri	@$ar2, $st1
+	srri	@$ar2, $st1
+	srri	@$ar2, $st1
+	srri	@$ar2, $st1
+	jmp	t_end
+
+/* loop addresses no code has, so nothing loops */
+t_sk2:
+	lri	$ar0, #0xf000
+	mrr	$st2, $ar0
+	iar	$ar0
+	mrr	$st2, $ar0
+	iar	$ar0
+	mrr	$st2, $ar0
+	iar	$ar0
+	mrr	$st2, $ar0
+	iar	$ar0
+	mrr	$st2, $ar0
+	iar	$ar0
+	mrr	$st2, $ar0
+	srri	@$ar2, $st2
+	srri	@$ar2, $st2
+	srri	@$ar2, $st2
+	srri	@$ar2, $st2
+	srri	@$ar2, $st2
+	srri	@$ar2, $st2
+	jmp	t_end
+
+/* loop counters, under a loop address no code has */
+t_sk3:
+	lri	$ar0, #0xf0ff
+	mrr	$st2, $ar0
+	lri	$ar0, #0x0101
+	mrr	$st3, $ar0
+	iar	$ar0
+	mrr	$st3, $ar0
+	iar	$ar0
+	mrr	$st3, $ar0
+	iar	$ar0
+	mrr	$st3, $ar0
+	iar	$ar0
+	mrr	$st3, $ar0
+	iar	$ar0
+	mrr	$st3, $ar0
+	srri	@$ar2, $st3
+	srri	@$ar2, $st3
+	srri	@$ar2, $st3
+	srri	@$ar2, $st3
+	srri	@$ar2, $st3
+	srri	@$ar2, $st3
+	mrr	$ar0, $st2
+	jmp	t_end
+
+/* 22: rb_compute's shape: one call, BLOOP, BLOOPI, then three BLOOPs one after another */
+t_rbnew:
+	call	t_cclr
+	lri	$acx0.l, #2
+	lri	$ix2, #3
+	call	trn_a
+	call	t_cst
+	jmp	t_end
+trn_a:
+	bloop	$acx0.l, trn_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloopi	#4, trn_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	bloop	$ix2, trn_r
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+trn_r:
+	nop
+	bloop	$ix2, trn_g
+	lr	$acc1.m, @C3
+	incm	$acc1.m
+	sr	@C3, $acc1.m
+trn_g:
+	nop
+	bloop	$ix2, trn_b
+	lr	$acc1.m, @C4
+	incm	$acc1.m
+	sr	@C4, $acc1.m
+trn_b:
+	nop
+trn_e2:
+	nop
+trn_e1:
+	nop
+	ret
+
+/* 23-25, 31, 38: 1 to 5 nested BLOOPs (3, 4, 5, 2 and 2 passes), no calls; 30, 39: with a LOOP inside */
+t_b1:
+	call	t_cclr
+	lri	$acx0.l, #3
+	bloop	$acx0.l, tb1_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+tb1_e1:
+	nop
+	call	t_cst
+	jmp	t_end
+
+t_b2:
+	call	t_cclr
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	bloop	$acx0.l, tb2_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloop	$acx1.l, tb2_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+tb2_e2:
+	nop
+tb2_e1:
+	nop
+	call	t_cst
+	jmp	t_end
+
+t_b3:
+	call	t_cclr
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	lri	$ix2, #5
+	bloop	$acx0.l, tb3_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloop	$acx1.l, tb3_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	bloop	$ix2, tb3_e3
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+tb3_e3:
+	nop
+tb3_e2:
+	nop
+tb3_e1:
+	nop
+	call	t_cst
+	jmp	t_end
+
+t_b3l:
+	call	t_cclr
+	clr	$acc0
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	lri	$ix2, #5
+	lri	$ix3, #2
+	bloop	$acx0.l, tb3l_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloop	$acx1.l, tb3l_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	bloop	$ix2, tb3l_e3
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+	loop	$ix3
+	incm	$acc0.m
+tb3l_e3:
+	nop
+tb3l_e2:
+	nop
+tb3l_e1:
+	nop
+	sr	@C3, $acc0.m
+	call	t_cst
+	jmp	t_end
+
+t_b4:
+	call	t_cclr
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	lri	$ix2, #5
+	lri	$ix3, #2
+	bloop	$acx0.l, tb4_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloop	$acx1.l, tb4_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	bloop	$ix2, tb4_e3
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+	bloop	$ix3, tb4_e4
+	lr	$acc1.m, @C3
+	incm	$acc1.m
+	sr	@C3, $acc1.m
+tb4_e4:
+	nop
+tb4_e3:
+	nop
+tb4_e2:
+	nop
+tb4_e1:
+	nop
+	call	t_cst
+	jmp	t_end
+
+t_b4l:
+	call	t_cclr
+	clr	$acc0
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	lri	$ix2, #5
+	lri	$ix3, #2
+	lri	$ix1, #2
+	bloop	$acx0.l, tb4l_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloop	$acx1.l, tb4l_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	bloop	$ix2, tb4l_e3
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+	bloop	$ix3, tb4l_e4
+	lr	$acc1.m, @C3
+	incm	$acc1.m
+	sr	@C3, $acc1.m
+	loop	$ix1
+	incm	$acc0.m
+tb4l_e4:
+	nop
+tb4l_e3:
+	nop
+tb4l_e2:
+	nop
+tb4l_e1:
+	nop
+	sr	@C4, $acc0.m
+	call	t_cst
+	jmp	t_end
+
+t_b5:
+	call	t_cclr
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	lri	$ix2, #5
+	lri	$ix3, #2
+	lri	$ix1, #2
+	bloop	$acx0.l, tb5_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloop	$acx1.l, tb5_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	bloop	$ix2, tb5_e3
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+	bloop	$ix3, tb5_e4
+	lr	$acc1.m, @C3
+	incm	$acc1.m
+	sr	@C3, $acc1.m
+	bloop	$ix1, tb5_e5
+	lr	$acc1.m, @C4
+	incm	$acc1.m
+	sr	@C4, $acc1.m
+tb5_e5:
+	nop
+tb5_e4:
+	nop
+tb5_e3:
+	nop
+tb5_e2:
+	nop
+tb5_e1:
+	nop
+	call	t_cst
+	jmp	t_end
+
+/* 26-29, 32-36: N2 nested calls (1-9), no loops; level i counts its entry in C(i-1) and its return in
+   C(9+i), and the end marks 0x0d0e */
+t_calls:
+	call	t_cclr
+	clr	$acc0
+	lr	$acc0.m, @P_N2
+	call	tc_1
+	call	t_cst
+	lri	$acx0.l, #0x0d0e
+	srri	@$ar2, $acx0.l
+	jmp	t_end
+tc_1:
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	decm	$acc0.m
+	jeq	tc_1x
+	call	tc_2
+tc_1x:
+	lr	$acc1.m, @C10
+	incm	$acc1.m
+	sr	@C10, $acc1.m
+	ret
+tc_2:
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	decm	$acc0.m
+	jeq	tc_2x
+	call	tc_3
+tc_2x:
+	lr	$acc1.m, @C11
+	incm	$acc1.m
+	sr	@C11, $acc1.m
+	ret
+tc_3:
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+	decm	$acc0.m
+	jeq	tc_3x
+	call	tc_4
+tc_3x:
+	lr	$acc1.m, @C12
+	incm	$acc1.m
+	sr	@C12, $acc1.m
+	ret
+tc_4:
+	lr	$acc1.m, @C3
+	incm	$acc1.m
+	sr	@C3, $acc1.m
+	decm	$acc0.m
+	jeq	tc_4x
+	call	tc_5
+tc_4x:
+	lr	$acc1.m, @C13
+	incm	$acc1.m
+	sr	@C13, $acc1.m
+	ret
+tc_5:
+	lr	$acc1.m, @C4
+	incm	$acc1.m
+	sr	@C4, $acc1.m
+	decm	$acc0.m
+	jeq	tc_5x
+	call	tc_6
+tc_5x:
+	lr	$acc1.m, @C14
+	incm	$acc1.m
+	sr	@C14, $acc1.m
+	ret
+tc_6:
+	lr	$acc1.m, @C5
+	incm	$acc1.m
+	sr	@C5, $acc1.m
+	decm	$acc0.m
+	jeq	tc_6x
+	call	tc_7
+tc_6x:
+	lr	$acc1.m, @C15
+	incm	$acc1.m
+	sr	@C15, $acc1.m
+	ret
+tc_7:
+	lr	$acc1.m, @C6
+	incm	$acc1.m
+	sr	@C6, $acc1.m
+	decm	$acc0.m
+	jeq	tc_7x
+	call	tc_8
+tc_7x:
+	lr	$acc1.m, @C16
+	incm	$acc1.m
+	sr	@C16, $acc1.m
+	ret
+tc_8:
+	lr	$acc1.m, @C7
+	incm	$acc1.m
+	sr	@C7, $acc1.m
+	decm	$acc0.m
+	jeq	tc_8x
+	call	tc_9
+tc_8x:
+	lr	$acc1.m, @C17
+	incm	$acc1.m
+	sr	@C17, $acc1.m
+	ret
+tc_9:
+	lr	$acc1.m, @C8
+	incm	$acc1.m
+	sr	@C8, $acc1.m
+	lr	$acc1.m, @C18
+	incm	$acc1.m
+	sr	@C18, $acc1.m
+	ret
+
+/* 37: the first rb_compute's shape, which failed on a Wii: call, BLOOP, BLOOPI, two calls to a BLOOP */
+t_rbold:
+	call	t_cclr
+	lri	$acx0.l, #2
+	lri	$ix2, #3
+	call	tro_a
+	call	t_cst
+	jmp	t_end
+tro_a:
+	bloop	$acx0.l, tro_e1
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	bloopi	#4, tro_e2
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+	call	tro_b
+	call	tro_b
+tro_e2:
+	nop
+tro_e1:
+	nop
+	ret
+tro_b:
+	bloop	$ix2, trob_e
+	lr	$acc1.m, @C2
+	incm	$acc1.m
+	sr	@C2, $acc1.m
+trob_e:
+	nop
+	ret
+
+/* 40: 12 pushes onto the call stack with interrupts enabled: does overflow raise exception 1? The
+   reported N1 says how far it got: 2801 when enabled (an exception left pending earlier), 2802 while
+   pushing, 2803 while popping. */
+t_ie:
+	lri	$acx0.l, #0x2801
+	sr	@V_TST, $acx0.l
+	sbset	#0x03
+	lri	$acx0.l, #0x2802
+	sr	@V_TST, $acx0.l
+	lri	$ar0, #0x1000
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	iar	$ar0
+	mrr	$st0, $ar0
+	lri	$acx0.l, #0x2803
+	sr	@V_TST, $acx0.l
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	srri	@$ar2, $st0
+	sbclr	#0x03
+	jmp	t_end
+
+/* 41, 42: a loop in a function called from inside a loop: BLOOP x2, call, BLOOP x3; then the same under
+   one more call */
+t_cl1:
+	call	t_cclr
+	lri	$acx0.l, #2
+	lri	$ix2, #3
+	bloop	$acx0.l, tcl1_e
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	call	tcl_b
+tcl1_e:
+	nop
+	call	t_cst
+	jmp	t_end
+t_cl2:
+	call	t_cclr
+	lri	$acx0.l, #2
+	lri	$ix2, #3
+	call	tcl2_a
+	call	t_cst
+	jmp	t_end
+tcl2_a:
+	bloop	$acx0.l, tcl2_e
+	lr	$acc1.m, @C0
+	incm	$acc1.m
+	sr	@C0, $acc1.m
+	call	tcl_b
+tcl2_e:
+	nop
+	ret
+tcl_b:
+	bloop	$ix2, tclb_e
+	lr	$acc1.m, @C1
+	incm	$acc1.m
+	sr	@C1, $acc1.m
+tclb_e:
+	nop
+	ret

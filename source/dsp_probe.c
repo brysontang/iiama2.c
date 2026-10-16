@@ -562,8 +562,32 @@ static const char *const TEST_NAMES[] = {
     "the int8 kernel (compute8 via CALLR), 2 rows x 16, groups of 8",
     "the readback kernel (rb_compute), 2 passes x 1 tile",
     "the accelerator: LRS, 'LDN (80f4), CLRP'LDN (84f4), MADDX'LDN (e3f4) reading ACDSAMP",
+    "call stack: 10 pushes, then 10 pops",
+    "data stack: 6 pushes, then 6 pops",
+    "loop address stack: 6 pushes, then 6 pops",
+    "loop counter stack: 6 pushes, then 6 pops",
+    "rb_compute's shape: a call, BLOOP x2, BLOOPI x4, then 3 BLOOPs x3 in a row",
+    "1 BLOOP (x3)",
+    "2 nested BLOOPs (x3, x4)",
+    "3 nested BLOOPs (x3, x4, x5)",
+    "1 call",
+    "2 nested calls",
+    "3 nested calls",
+    "4 nested calls",
+    "3 nested BLOOPs and a LOOP (x2) inside",
+    "4 nested BLOOPs (x3, x4, x5, x2)",
+    "5 nested calls",
+    "6 nested calls",
+    "7 nested calls",
+    "8 nested calls",
+    "9 nested calls",
+    "the first rb_compute's shape: a call, BLOOP x2, BLOOPI x4, two calls to a BLOOP x3",
+    "5 nested BLOOPs (x3, x4, x5, x2, x2)",
+    "4 nested BLOOPs and a LOOP (x2) inside",
+    "12 pushes onto the call stack with interrupts enabled",
+    "BLOOP x2 calling a function with BLOOP x3 in it",
+    "a call, then BLOOP x2 calling a function with BLOOP x3 in it",
 };
-#define N_TESTS (int)(sizeof(TEST_NAMES) / sizeof(TEST_NAMES[0]) - 1)
 
 static void put40(u16 *e, long long v) { // as the tests store an accumulator: .h (read sign-extended), .m, .l
     e[0] = (u16)(int16_t)(int8_t)(v >> 32);
@@ -694,6 +718,59 @@ static int test_setup(int t, u16 *d, u8 *acc, u32 acc_phys, u16 *n, u16 *e, u8 *
         }
         return 96;
     }
+    case 18: // the stacks, pushed and popped directly
+    case 19:
+    case 20:
+    case 21:
+    case 40: {
+        static const u16 first[] = {0x1000, 0x1100, 0xf000, 0x0101};
+        int k = t == 18 ? 10 : t == 40 ? 12 : 6;
+        for (int i = 0; i < k; i++) e[i] = (u16)(first[t == 40 ? 0 : t - 18] + k - 1 - i);
+        return k;
+    }
+    case 22: // counters: one per loop body
+        memset(e, 0, 40);
+        e[0] = 2, e[1] = 8, e[2] = e[3] = e[4] = 24;
+        return 20;
+    case 37:
+        memset(e, 0, 40);
+        e[0] = 2, e[1] = 8, e[2] = 48;
+        return 20;
+    case 41:
+    case 42:
+        memset(e, 0, 40);
+        e[0] = 2, e[1] = 6;
+        return 20;
+    case 23:
+    case 24:
+    case 25:
+    case 30:
+    case 31:
+    case 38:
+    case 39: {
+        static const u16 passes[5] = {3, 12, 60, 120, 240};
+        int levels = t == 23 ? 1 : t == 24 ? 2 : t == 25 || t == 30 ? 3 : t == 31 || t == 39 ? 4 : 5;
+        if (t == 30 || t == 39) levels++; // the LOOP's passes
+        memset(e, 0, 40);
+        for (int i = 0; i < levels; i++) e[i] = passes[i];
+        return 20;
+    }
+    case 26:
+    case 27:
+    case 28:
+    case 29:
+    case 32:
+    case 33:
+    case 34:
+    case 35:
+    case 36: { // calls: each level's entry and return, then the marker
+        int depth = t <= 29 ? t - 25 : t - 27;
+        n[1] = (u16)depth;
+        memset(e, 0, 42);
+        for (int i = 0; i < depth; i++) e[i] = 1, e[10 + i] = 1;
+        e[20] = 0x0d0e;
+        return 21;
+    }
     case 17: {
         u32 end = acc_phys + 32 + 64;
         n[2] = (u16)(end >> 16), n[4] = (u16)end;
@@ -707,11 +784,12 @@ static int test_setup(int t, u16 *d, u8 *acc, u32 acc_phys, u16 *n, u16 *e, u8 *
     return 0;
 }
 
-static void probe_tests(void) {
-    g_log("probe: DSP instruction tests (the answers are Dolphin's)\n");
+// The tests in `order`; the answers are Dolphin's.
+static void probe_tests(const u8 *order, int count) {
     u16 *d = g_tdata;
     u8 *acc = (u8 *)(g_tdata + 192);
-    for (int t = 1; t <= N_TESTS && !g_dead; t++) {
+    for (int o = 0; o < count && !g_dead; o++) {
+        int t = order[o];
         u16 n[9] = {0}, e[96];
         u8 care[96];
         int words = test_setup(t, d, acc, PHYS(acc), n, e, care);
@@ -733,6 +811,12 @@ static void probe_tests(void) {
             continue;
         }
         g_log("dsp: test %2d WRONG in %d of %d words: %s:%s\n", t, bad, words, TEST_NAMES[t], detail);
+        if (t >= 18) { // all of it: these are measurements more than checks
+            len = 0;
+            for (int i = 0; i < words && len < (int)sizeof(detail) - 6; i++)
+                len += snprintf(detail + len, sizeof(detail) - len, " %04x", g_out[i]);
+            g_log("dsp: test %2d answered%s\n", t, detail);
+        }
         if (t == 2 && g_out[0] == 0x0bad) g_log("dsp: so SI stores only to hardware registers, as the manual says\n");
         if (t == 9 && (g_out[8] != e[8] || g_out[9] != e[9]))
             g_log("dsp: (words 8-9 are two loads from one bank, where Dolphin gives both the first address's word)\n");
@@ -753,7 +837,10 @@ static void sections(LlmModel *m) {
     size_t cpu_bytes = (size_t)m->c.vocab_size * m->c.dim * (m->dtype == LLM_DTYPE_Q8 ? 1 : 4);
     char what[64];
 
-    probe_tests();
+    // the instruction tests, and the shape rb_compute has (its first shape failed on a Wii)
+    static const u8 early[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 22};
+    g_log("probe: DSP instruction tests (the answers are Dolphin's)\n");
+    probe_tests(early, sizeof(early));
 
     g_log("probe: DSP DMA, MEM1\n");
     dma_check(g_m1, g_m1 + 4096, 0);
@@ -805,6 +892,14 @@ static void sections(LlmModel *m) {
         kernel(what, OP_ACC8, cls, cls, TEST_ROWS, dim, dim, 0);
     }
     kernel("accelerator, MEM2", OP_ACC8, g_w8, g_m2, TEST_ROWS, TEST_N, TEST_N, 0);
+
+    // Last, since past a stack's limit the DSP may never answer again: how deep calls and loops really
+    // go, shallowest first, then the stacks pushed directly, then deeper, then whether an overflow raises
+    // exception 1 once interrupts are enabled.
+    static const u8 late[] = {23, 24, 25, 26, 27, 28, 29, 18, 19, 20, 21, 30, 31, 32,
+                              33, 34, 35, 36, 41, 42, 37, 38, 39, 40};
+    g_log("probe: DSP stack limits (the answers are Dolphin's, whose stacks are 32 deep)\n");
+    probe_tests(late, sizeof(late));
 }
 
 void dsp_probe_run(LlmModel *m, DspLogFn log) {
