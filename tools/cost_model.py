@@ -5,7 +5,7 @@ Costs each engine in source/main.c on a real Wii, fitted to one.
     python3 tools/cost_model.py models/stories15M.bin
     python3 tools/cost_model.py models/stories15M.bin --pos 200 --sampling
     python3 tools/cost_model.py models/stories15M.bin --before   # the engines as first run on a Wii
-    python3 tools/cost_model.py models/stories15M.bin --unstacked  # GPU engines before wq, wk, wv were stacked
+    python3 tools/cost_model.py models/stories15M.bin --stacked  # wq|wk|wv and w1|w3 as one GPU matrix each
 
 Bottom-up: count the work each engine does per token, cost it with per-
 operation numbers, and add memory traffic at an effective bandwidth. Dolphin
@@ -39,9 +39,15 @@ of what the Wii then measured. The next round's prediction missed GPU fast by
 missed by 3% (51 vs 49.4): it read the float KV cache at main-memory speed,
 when at positions 0-63 it mostly sits in L2, so shrinking it to int8 saved less
 than predicted. How the KV cache costs further into a story is a guess until a
-long run measures it. MEASURED predates stacking wq, wk, wv and w1, w3 into one
-GPU matrix each, so the fit is checked with --unstacked; the default is the
-prediction for stacking.
+long run measures it.
+
+Then it predicted that stacking wq, wk, wv and w1, w3 into one GPU matrix each
+(--stacked) would take GPU fast from 49.4 to 52 tok/s, by saving draws. On the
+Wii it fell to 42.6: what costs GPU time is the shape of a pass's framebuffer
+region, which the model doesn't know about (a 128x4 region drew 3-4x slower
+per pixel than 24x4, and 4-pixel-wide regions faster still). The engines don't
+stack. Paired singles on the CPU and those 4-pixel-wide regions came after the
+fit (GPU fast 59.9, CPU 12.6, split 25.0 tok/s); the model knows neither yet.
 
 Useful for asking what a change would buy before writing it. Stdlib only.
 """
@@ -62,7 +68,7 @@ PARAMS = {
 }
 
 # What the Wii measured (SD:/llama/bench_out.txt, stories15M, 64 greedy tokens, positions 0-63): the
-# engines as first run, and before the GPU engines stacked wq, wk, wv and w1, w3 (--unstacked).
+# engines as first run, and the round this is fitted to (before paired singles and narrow regions).
 MEASURED_BEFORE = {"CPU": 7.41, "split (GPU classifier + CPU top-64)": 12.29, "GPU, fast (clamp8)": 20.55,
                    "GPU, exact (exact11)": 9.46, "GPU, exact + CPU top-64": 9.41}
 MEASURED = {"CPU": 7.44, "split (GPU classifier + CPU top-256)": 16.06, "GPU, fast (clamp8)": 49.41,
@@ -223,7 +229,7 @@ def rescore_s(c, k, p):
     return (k * c["dim"] * INT8_CYC_PER_MAC + c["vocab"] * 9) / CPU_HZ + k * c["dim"] / p["cpu_bw"]
 
 
-def engine_s(c, engine, p, pos, sampling, before=False, stacked=True):
+def engine_s(c, engine, p, pos, sampling, before=False, stacked=False):
     """before: the engines as first measured, with the classifier as 18 clamp8 passes per row.
     stacked: the GPU engines run wq, wk, wv as one matrix and w1, w3 as another (not before)."""
     layers, cls = matrices(c, stacked and not before and engine.startswith("GPU"))
@@ -263,8 +269,8 @@ def main():
     ap.add_argument("--pos", type=int, default=32, help="context position to cost attention at (default 32, the bench's average)")
     ap.add_argument("--sampling", action="store_true", help="include temperature sampling (the app's default)")
     ap.add_argument("--before", action="store_true", help="the engines as first run on a Wii (what the first fit used)")
-    ap.add_argument("--unstacked", action="store_true",
-                    help="the GPU engines with wq, wk, wv and w1, w3 as separate matrices (what MEASURED ran)")
+    ap.add_argument("--stacked", action="store_true",
+                    help="the GPU engines with wq|wk|wv and w1|w3 as one matrix each (what-if; slower on a Wii)")
     args = ap.parse_args()
 
     c = read_config(args.model)
@@ -275,13 +281,13 @@ def main():
     print("|---|---|---|---|")
     cpu = 1 / engine_s(c, "CPU", PARAMS, args.pos, args.sampling)[0]
     for e in engines:
-        tps = 1 / engine_s(c, e, PARAMS, args.pos, args.sampling, args.before, not args.unstacked)[0]
+        tps = 1 / engine_s(c, e, PARAMS, args.pos, args.sampling, args.before, args.stacked)[0]
         m = measured.get(e)
         print(f"| {e} | {tps:.1f} | {tps / cpu:.1f}x | {f'{m:.2f}' if m else '-'} |")
 
     print("\nwhere a token's time goes (ms):\n")
     for e in engines:
-        total, parts = engine_s(c, e, PARAMS, args.pos, args.sampling, args.before, not args.unstacked)
+        total, parts = engine_s(c, e, PARAMS, args.pos, args.sampling, args.before, args.stacked)
         print(f"  {e}: {total * 1e3:.1f} ms = " + ", ".join(f"{k} {v * 1e3:.1f}" for k, v in parts.items() if v > 5e-5))
 
 

@@ -10,7 +10,7 @@ The Wii does technically have a GPU. Hollywood is fixed-function, with no shader
 
 <sub>The first run on real hardware: stories15M on the CPU engine, on a TV through an HDMI adapter. The GPU engines told garbage stories on that run (the self-test hashes on screen are wrong); see [Dolphin vs a real Wii](#dolphin-vs-a-real-wii) for why.</sub>
 
-**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 49.4 tok/s with stories15M, 6.6x the CPU alone. See [Speed](#speed-on-a-real-wii).
+**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 59.9 tok/s with stories15M, 4.8x the CPU alone (which got faster too: 12.6 tok/s, up from 7.4). See [Speed](#speed-on-a-real-wii).
 
 ## Quick start
 
@@ -92,6 +92,9 @@ GPU fast leans on more of the hardware:
 - **Raw register writes.** Per pass, only the konst colors, the stages' add/subtract ops and the texture addresses change, so they go straight down the write-gather pipe as GPU register writes instead of through libogc's setters.
 - **Pipelining.** Passes go in chunks of six, each copied out behind a draw-sync token, so the CPU sums one chunk while the GPU draws the next.
 - **MEM1 for the copies.** The CPU reads MEM1 almost three times faster than MEM2, so a small buffer for framebuffer copies is reserved there before the model loads.
+- **Tall, narrow pass regions.** Each layer pass draws into a region 4 pixels wide (4x64 for w1), not the squat 64x4 that fits the same pixels. A texture holds 8 input columns side by side, so in a narrow region a block of pixels finds all of them in neighbouring texture tiles. The same matmul runs 17-30% faster that way on a Wii (see [the probes](#what-the-probes-measured)).
+
+Every engine's CPU work uses paired singles too. `psq_l` loads two int8 weights as floats in one instruction (the GQR register says `s8`), so the int8 matmul runs two rows at a time, and attention scores four positions at once, two per register. Each lane does exactly the scalar loop's multiply-adds in the same order, so the floats are bit for bit the same: the bench checks that at boot ("paired singles: 0 of 827 ... differ").
 
 ### Accuracy
 
@@ -115,10 +118,10 @@ stories15M, int8, the bench's 64-token greedy story (see [below](#running-it-on-
 
 | Engine | tok/s | vs CPU |
 |---|---|---|
-| CPU | 7.44 | 1x |
-| split | 16.06 | 2.2x |
-| GPU, fast | 49.41 | 6.6x |
-| GPU, exact | 21.91 | 2.9x |
+| CPU | 12.57 | 1x |
+| split | 25.00 | 2.0x |
+| GPU, fast | 59.89 | 4.8x |
+| GPU, exact | 22.75 | 1.8x |
 
 How it got there, one round of changes at a time:
 
@@ -128,19 +131,34 @@ How it got there, one round of changes at a time:
 | Blending the output layer's passes in the framebuffer | 7.41 | 15.34 | 30.01 | 17.36 |
 | GPU fast: per-row scales, paired-single readback, raw register writes, pipelining, MEM1 copies | 7.41 | 15.38 | 43.51 | 20.62 |
 | 16-bit output layer, int8 KV cache, RoPE once per token | 7.44 | 16.06 | 49.41 | 21.91 |
+| Paired singles for the CPU's int8 matmul and attention, `sqrtf` once per layer | 12.57 | 25.01 | 53.62 | 22.77 |
+| Tall, narrow pass regions for GPU fast's layers | 12.57 | 25.00 | 59.89 | 22.75 |
+
+In between, stacking wq, wk and wv into one GPU matrix, and w1 with w3, cut GPU fast's draws by a third and made it slower (42.6 tok/s): stacked w1|w3 drew in 128x4 regions, 3-4x slower per pixel than w2 in 24x4. That's what sent the probes after region shapes. Stacked in narrow regions it still loses to two separate matmuls, so the engines don't stack.
 
 Where a GPU-fast token's time goes, in ms:
 
-| | now (20 ms) | GPU fast round (23 ms) | blending (33 ms) | first run (49 ms) |
-|---|---|---|---|---|
-| CPU issuing GX commands | 1.7 | 1.7 | 4.7 | 4.6 |
-| CPU waiting for the GPU | 7.5 | 9.7 | 9.6 | 9.9 |
-| CPU reading the framebuffer back and summing passes | 5.0 | 5.0 | 12.9 | 29.0 |
-| Everything else (attention, norms, SiLU, recomputing the top 256) | 6.0 | 6.6 | 6.0 | 5.1 |
+| | now (17 ms) | RGB565 round (20 ms) | GPU fast round (23 ms) | blending (33 ms) | first run (49 ms) |
+|---|---|---|---|---|---|
+| CPU issuing GX commands | 1.7 | 1.7 | 1.7 | 4.7 | 4.6 |
+| CPU waiting for the GPU | 5.1 | 7.5 | 9.7 | 9.6 | 9.9 |
+| CPU reading the framebuffer back and summing passes | 5.1 | 5.0 | 5.0 | 12.9 | 29.0 |
+| Everything else | 4.8 | 6.0 | 6.6 | 6.0 | 5.1 |
 
-The 16-bit output layer cut the waiting by 2.1 ms a token, just what the probe timed (below). The output layer is still more than half of it: 4.3 ms of GPU time, where the TEV alone would need 3.2. The readback costs about 21 cycles per pixel and pass against the 5 its instructions need, in cache misses on the copy.
+The bench now profiles every part of a token (`bench_out.txt`, "per token" lines). GPU fast's 16.7 ms:
 
-`tools/cost_model.py` is fitted to these runs and reproduces every engine in the last two rounds within 2.5%. Fitted to the first run, it predicted blending's speedups within 4% before the code was written. The next round it missed by 17%, on the readback's misses and about 2.6 µs of GPU time per draw that nothing measured yet explains. This round it missed by 3% (51 predicted, 49.4 measured): it read the float KV cache at main-memory speed, when at these positions it mostly sits in the L2 cache, so shrinking it saved less than expected. The model puts most of this round's 0.6 ms off "everything else" on RoPE's trig functions, though the bench can't tell the two apart. The KV cache should matter more later in a story, which the 64-token bench doesn't reach.
+| Part | ms |
+|---|---|
+| Output layer (GPU blend, readback, scales) | 5.78 |
+| Layer matmuls: q/k/v 1.94, wo 0.65, w1/w3 2.84, w2 1.47 | 6.90 |
+| Recomputing the top 256 rows: finding them 0.64, the dot products 0.59 | 1.24 |
+| Attention: q.k 0.35, softmax 0.33, att*v 0.33, quantizing the new k and v 0.25 | 1.26 |
+| SiLU (4,608 `expf` calls) | 1.07 |
+| Sampling, RMSNorm, RoPE, residuals, embedding | 0.45 |
+
+The output layer is the biggest piece: 4.3 ms of GPU time where the TEV alone would need 3.2, and it already has the best region shape of 13 tried. The CPU engine spends 46 of its 80 ms on the output layer, so a smaller vocab helps every engine (see the ideas below).
+
+`tools/cost_model.py` is fitted to the RGB565 round and reproduces every engine in it and the round before within 2.5%. Fitted to the first run, it predicted blending's speedups within 4% before the code was written. It then missed GPU fast by 17% (51 vs 43.5 tok/s), on the readback's cache misses and about 2.6 µs of GPU time per draw it couldn't explain, and by 3% the round after (51 vs 49.4), by reading the float KV cache at main-memory speed when at these positions it mostly sits in the L2 cache. Its prediction for stacking (52) was the wrong direction entirely: it charged GPU time per draw, when what matters is the shape of each draw's region. It doesn't model paired singles or region shapes yet.
 
 ### What the probes measured
 
@@ -149,17 +167,28 @@ The 16-bit output layer cut the waiting by 2.1 ms a token, just what the probe t
 - **The TEV isn't the limit; texture fetch is.** With no texture, or one small texture that stays in the cache, the output layer's 18 passes take 3.2 ms: 951 million pixel-stages a second, four pixels per GPU clock. Fetching RGBA8 textures from MEM2 doubled that to 6.4 ms. 16-bit RGB565 textures take 4.3 ms, so that's what the output layer uses now, and an 8-bit format would take 4.0.
 - **MEM2 is slow for the CPU.** Streaming reads run at 408 MB/s from MEM1 and 147 MB/s from MEM2. `dcbt` prefetching doesn't help either.
 - **Raw register writes** cost 1.7 µs per pass against 3.3 through libogc, with identical results. Draw-sync tokens work for pipelining.
+- **The shape of a pass's region matters more than the number of draws.** The same matmul, the same sums (a hash checks), different framebuffer layouts:
+
+  | Matrix | Region | One matmul |
+  |---|---|---|
+  | w1 | 64x4 / 8x32 / 4x64 | 0.31 / 0.28 / 0.22 ms |
+  | w2 | 24x4 / 4x24 | 0.29 / 0.24 ms |
+  | w1 and w3 stacked | 128x4 / 32x16 / 4x128 | 1.40 / 0.59 / 0.47 ms |
+  | output layer | 116x92 / 108x100 / 128x84 | 5.3 / 5.7 / 24.2 ms |
+
+  Layer matrices like being 4 pixels wide. The output layer is the opposite: of 13 widths, 116 was best, and power-of-two widths were 2-5x slower, which looks like the texture cache aliasing. The GPU's performance counters could say for sure, but through libogc only the clock counter reads anything on a Wii.
+- **The audio DSP is free, fast to talk to, and doesn't get in the way.** `source/dsp_probe.c` loads custom microcode (assembled with devkitPro's `gcdsptool`) into the DSP, which runs it at 121.5 MHz. A mailbox round trip from the CPU takes 0.6 µs, and DMA from MEM1 reaches 500 MB/s, faster than the CPU streams it. Neither the CPU's streaming nor the GPU's output layer slowed down while it ran. Its dot-product kernels match the CPU bit for bit in Dolphin but reset the DSP on a real Wii, so that part is still being chased.
 - **Locked-cache DMA crashes.** Broadway can lock half its L1 cache as a scratchpad and DMA into it, but on a Wii, libogc's `LCLoadData` ended in a Machine Check exception.
 
 ## Running it on a real Wii
 
-Put an empty `bench.txt` in `SD:/llama/` and the app runs every engine on the same greedy story at boot. It shows tok/s and the GPU time split (issuing, waiting, reading back) on screen, and writes the same to `SD:/llama/bench_out.txt`. A `steps N` line in `bench.txt` sets the story length (default 64). Delete `bench.txt` to get the normal menu back. To check a bench run against the simulator:
+Put an empty `bench.txt` in `SD:/llama/` and the app runs every engine on the same greedy story at boot. It shows tok/s, the GPU time split (issuing, waiting, reading back) and a per-token profile on screen, and writes the same to `SD:/llama/bench_out.txt`. A `steps N` line in `bench.txt` sets the story length (default 64). Delete `bench.txt` to get the normal menu back. To check a bench run against the simulator:
 
 ```sh
 uv run tools/tev_sim/check_dolphin.py models/stories15M.bin models/tokenizer.bin bench_out.txt
 ```
 
-If the GPU engines disagree with the CPU, put an empty `probe.txt` in `SD:/llama/` as well. The app then runs `source/gx_probe.c` first: small draws that test texture sampling, the konst registers, a color register's value and how out-of-range pixels are written, one multiply-add stage over every weight byte, the exact11 halving stages, blending and how 16-bit texels widen to 8 bits, plus raw dumps of real matmuls (each hashed three times, and two of them dumped as floats), then the timings above. It writes `SD:/llama/probe.bin` and `probe_out.txt`, and this says what came out different and how:
+If the GPU engines disagree with the CPU, put an empty `probe.txt` in `SD:/llama/` as well. The app then runs `source/gx_probe.c` first: small draws that test texture sampling, the konst registers, a color register's value and how out-of-range pixels are written, one multiply-add stage over every weight byte, the exact11 halving stages, blending and how 16-bit texels widen to 8 bits, plus raw dumps of real matmuls (each hashed three times, and two of them dumped as floats), then the timings above. After the timings come the region-shape and DSP probes. It writes `SD:/llama/probe.bin` and `probe_out.txt`, and this says what came out different and how:
 
 ```sh
 uv run tools/tev_sim/check_probe.py models/stories15M.bin probe.bin
@@ -227,6 +256,7 @@ The GPU path was checked in layers:
 - **The TEV math.** `tools/tev_sim/tev.py` follows the combiner arithmetic in Dolphin's software renderer (`Tev.cpp`). The probes confirmed it on a real Wii: one multiply-add stage for all 256 weight bytes against 10 activation values in both signs, the halving stages, out-of-range writes (they wrap like a u8 cast) and RGB565 texels (they widen to 8 bits by repeating their top bits).
 - **The simulator against Dolphin.** Run in Dolphin, the Wii build's integer outputs match the simulator bit for bit: the pass sums for two matrix shapes in both output modes, and the blended output layer's framebuffer. So do the float outputs of a whole matmul in both modes, down to the last bit, since the simulator rounds the way Broadway's fused multiply-add does. Over 64 greedy tokens, three of the four engines tell the same story as the simulator. GPU fast drifts off after about 20 tokens: it requantizes activations to 8 bits at every layer, so one rounding that goes the other way, from float differences between numpy and C outside the matmuls, gives the rest of the story different quantization noise.
 - **The simulator against a real Wii.** The same integer hashes, probe images and float outputs, bit for bit. The Wii's text output is identical to Dolphin's for all four engines.
+- **Paired singles against the scalar loops.** At boot the bench runs both on three real matrices and both attention kernels and compares the floats bit by bit: 0 of 827 differ, in Dolphin and on a Wii.
 - **The simulator against the C engine.** The numpy port in `tools/tev_sim/llama.py` reproduces the C engine's greedy stories exactly, fp32 and int8.
 
 Note that the default build sums each matmul row with 4 accumulators for speed, so its fp32 output can differ from upstream in the last bits. Build with `-DLLM_EXACT_MATMUL` if you want upstream-exact numerics.
@@ -238,6 +268,7 @@ Note that the default build sums each matmul row with 4 accumulators for speed, 
 | `source/llm.c`, `llm.h` | The inference engine (forward pass, BPE tokenizer, sampler). Portable C, no mmap, no `exit()`. |
 | `source/gx_matmul.c` | Weight matmuls on the GPU's TEV, for the split and GPU engines. |
 | `source/gx_probe.c` | Hardware probes for the GPU path (`probe.txt`). |
+| `source/dsp_probe.c`, `dsp_probe.ds` | The audio DSP probe and its microcode (built with `gcdsptool`). |
 | `source/main.c` | The Wii app: SD loading with a progress bar, prompt menu, engine switch, word-wrapped output, tok/s, bench mode, autoplay, screenshots. |
 | `Makefile` | devkitPPC build (stock devkitPro Wii template + libfat). |
 | `host/` | Desktop build of the same engine, for testing exported files on your PC or under `qemu-ppc`. |
@@ -251,11 +282,13 @@ Note that the default build sums each matmul row with 4 accumulators for speed, 
 
 ## Ideas for next steps
 
-- **Feed the TEV faster.** Even with 16-bit textures, the output layer spends a quarter of its GPU time waiting on texture fetch. The GPU can bulk-load textures into its 1 MB of texture memory ahead of a draw (one output-layer pass is 342 KB now), which might let the TEV run at its full rate.
-- **Fewer, bigger draws.** q, k and v multiply the same input, and so do the FFN's w1 and w3. Stacking each group's rows into one matrix would cut GPU fast's draws per token by a third, and the cost model puts ~2.6 µs on each.
-- **Paired singles for the CPU matmul.** The readback uses `psq_lx` now, but `matmul_q8` still converts int8 weights through a lookup table. `psq_l` can load two int8 values as floats in one instruction, which would cut the CPU engine's loads by more than half.
+- **Put the DSP to work.** It could take a share of the framebuffer readback and of the top-256 recompute while the CPU does the rest, maybe 1-2 ms a token, once its kernels run right on hardware.
+- **A faster exp.** SiLU and softmax spend about 1.4 ms a token in `expf`. A cheaper exp changes the floats, so the simulator has to copy it exactly.
+- **Feed the TEV faster.** Even with 16-bit textures, the output layer spends a quarter of its GPU time waiting on texture fetch. The GPU can bulk-load textures into its 1 MB of texture memory ahead of a draw (one output-layer pass is 342 KB), which might let the TEV run at its full rate.
 - **The locked cache, done right.** Locked-cache DMA crashed on a Wii (above). If it can be made to work, double-buffering weights through it could hide the CPU's memory stalls, which `dcbt` can't.
 - **Train your own.** A ~15M model trained on a narrow domain (a grumpy turtle king, say) on a single gaming GPU is more coherent and much funnier than a general one. Use a small vocab while you're at it: on stories15M, the 32000-token output layer is ~60% of the work per token, and a 4096-token vocab (llama2.c's `--vocab_source=custom`) roughly halves it. Export with llama2.c's `export.py --version 0`, then run it through `export_wii.py`.
+
+Ruled out so far: stacking matrices into fewer, bigger draws ([above](#speed-on-a-real-wii)), and doing math on the GPU's vertex unit (XF). Weights can't stream into its 512 floats of matrix memory anywhere near fast enough, and its results can only leave through the TEV, which would rather do the multiply itself.
 
 ## Credits
 
