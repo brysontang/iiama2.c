@@ -43,6 +43,9 @@ typedef struct {
 
 typedef struct {
     LlmMatrix wq, wk, wv, wo, w1, w2, w3;
+    // GPU copies of wq, wk, wv stacked into one matrix (their rows in that order), and of w1, w3, so each
+    // group runs as one matmul (or NULL). The matrices in a stack have no GPU copy of their own.
+    void *gpu_qkv, *gpu_w13;
 } LlmLayer;
 
 typedef struct {
@@ -53,6 +56,7 @@ typedef struct {
     LlmLayer *layers;
     // activations + KV cache. int8 models keep the cache in int8 with one scale per head and position
     // (key_cache8 etc.), a quarter of the bytes for attention to read; fp32 models keep it in float.
+    // hb2 follows hb in memory, and in int8 models k and v follow q, so a stacked GPU matmul writes them all.
     float *x, *xb, *xb2, *hb, *hb2, *q, *att, *logits, *key_cache, *value_cache;
     int8_t *key_cache8, *value_cache8;
     float *key_scale, *value_scale; // [layer][position][kv head]

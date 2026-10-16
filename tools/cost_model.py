@@ -5,6 +5,7 @@ Costs each engine in source/main.c on a real Wii, fitted to one.
     python3 tools/cost_model.py models/stories15M.bin
     python3 tools/cost_model.py models/stories15M.bin --pos 200 --sampling
     python3 tools/cost_model.py models/stories15M.bin --before   # the engines as first run on a Wii
+    python3 tools/cost_model.py models/stories15M.bin --unstacked  # GPU engines before wq, wk, wv were stacked
 
 Bottom-up: count the work each engine does per token, cost it with per-
 operation numbers, and add memory traffic at an effective bandwidth. Dolphin
@@ -38,7 +39,9 @@ of what the Wii then measured. The next round's prediction missed GPU fast by
 missed by 3% (51 vs 49.4): it read the float KV cache at main-memory speed,
 when at positions 0-63 it mostly sits in L2, so shrinking it to int8 saved less
 than predicted. How the KV cache costs further into a story is a guess until a
-long run measures it.
+long run measures it. MEASURED predates stacking wq, wk, wv and w1, w3 into one
+GPU matrix each, so the fit is checked with --unstacked; the default is the
+prediction for stacking.
 
 Useful for asking what a change would buy before writing it. Stdlib only.
 """
@@ -59,7 +62,7 @@ PARAMS = {
 }
 
 # What the Wii measured (SD:/llama/bench_out.txt, stories15M, 64 greedy tokens, positions 0-63): the
-# engines as first run, and now.
+# engines as first run, and before the GPU engines stacked wq, wk, wv and w1, w3 (--unstacked).
 MEASURED_BEFORE = {"CPU": 7.41, "split (GPU classifier + CPU top-64)": 12.29, "GPU, fast (clamp8)": 20.55,
                    "GPU, exact (exact11)": 9.46, "GPU, exact + CPU top-64": 9.41}
 MEASURED = {"CPU": 7.44, "split (GPU classifier + CPU top-256)": 16.06, "GPU, fast (clamp8)": 49.41,
@@ -75,6 +78,7 @@ ROWS_CYC_PER_PIXEL_PASS = 21.0  # GPU fast (sum_pixel): per pixel (3 rows) and p
 EXACT_CYC_PER_ROW_PASS = 24.8   # exact11: two bytes, two table lookups and a scale per row and pass
 BLEND_CYC_PER_ROW = 32.4        # the blended output layer: a byte, a row scale and a logit per row
 ROWS_CHUNK = 6                  # passes per framebuffer copy (gx_matmul.c's CHUNK)
+HOT_BYTES = 128 * 1024          # the MEM1 copy buffer; exact11 batches are cut to fit it (gx_matmul.c's g_hot)
 ISSUE_CYC = {"clamp8": 1270, "exact11": 940}  # per pass, raw register writes (probe)
 # Before: copies in MEM2, libogc's setters
 READBACK_CYC = 13.0      # per row and pass, clamp8, plus the copy and scales at cpu_bw
@@ -97,10 +101,15 @@ def read_config(path):
             "seq_len": seq}
 
 
-def matrices(c):
+def matrices(c, stacked=False):
+    """(rows, cols) of every layer matrix, and the classifier's. stacked: as the GPU engines upload them,
+    wq, wk, wv's rows in one matrix and w1, w3's in another."""
     kv = c["dim"] * c["kv_heads"] // c["heads"]
-    layer = [(c["dim"], c["dim"]), (kv, c["dim"]), (kv, c["dim"]), (c["dim"], c["dim"]),
-             (c["hidden"], c["dim"]), (c["dim"], c["hidden"]), (c["hidden"], c["dim"])]
+    if stacked:
+        layer = [(c["dim"] + 2 * kv, c["dim"]), (c["dim"], c["dim"]), (2 * c["hidden"], c["dim"]), (c["dim"], c["hidden"])]
+    else:
+        layer = [(c["dim"], c["dim"]), (kv, c["dim"]), (kv, c["dim"]), (c["dim"], c["dim"]),
+                 (c["hidden"], c["dim"]), (c["dim"], c["hidden"]), (c["hidden"], c["dim"])]
     return layer * c["layers"], [(c["vocab"], c["dim"])]
 
 
@@ -168,6 +177,9 @@ def gpu_matmul_s(mats, mode, p, before=False):
         pw, ph = region(rows)
         passes = n // cols_per_pass
         per_batch = (640 // pw) * (480 // ph) // draws
+        hot = HOT_BYTES // ((640 // pw) * pw * ph * 4) * (640 // pw) // draws  # passes whose copy fits in MEM1
+        if not before and 0 < hot < per_batch:
+            per_batch = hot
         batches = ceil_div(passes, per_batch)
         px = pw * ph
         pixel_stages = passes * px * sum(stages)
@@ -206,9 +218,10 @@ def rescore_s(c, k, p):
     return (k * c["dim"] * INT8_CYC_PER_MAC + c["vocab"] * 9) / CPU_HZ + k * c["dim"] / p["cpu_bw"]
 
 
-def engine_s(c, engine, p, pos, sampling, before=False):
-    """before: the engines as first measured, with the classifier as 18 clamp8 passes per row."""
-    layers, cls = matrices(c)
+def engine_s(c, engine, p, pos, sampling, before=False, stacked=True):
+    """before: the engines as first measured, with the classifier as 18 clamp8 passes per row.
+    stacked: the GPU engines run wq, wk, wv as one matrix and w1, w3 as another (not before)."""
+    layers, cls = matrices(c, stacked and not before and engine.startswith("GPU"))
     other = OTHER_INSTR + ROPE_INSTR["per layer" if before else "per token"] + (SAMPLING_INSTR if sampling else 0)
     base = attention_s(c, pos, p, "f32" if before else "int8") + other / (p["ipc"] * CPU_HZ)
     parts = {"attention+other": base}
@@ -245,6 +258,8 @@ def main():
     ap.add_argument("--pos", type=int, default=32, help="context position to cost attention at (default 32, the bench's average)")
     ap.add_argument("--sampling", action="store_true", help="include temperature sampling (the app's default)")
     ap.add_argument("--before", action="store_true", help="the engines as first run on a Wii (what the first fit used)")
+    ap.add_argument("--unstacked", action="store_true",
+                    help="the GPU engines with wq, wk, wv and w1, w3 as separate matrices (what MEASURED ran)")
     args = ap.parse_args()
 
     c = read_config(args.model)
@@ -255,13 +270,13 @@ def main():
     print("|---|---|---|---|")
     cpu = 1 / engine_s(c, "CPU", PARAMS, args.pos, args.sampling)[0]
     for e in engines:
-        tps = 1 / engine_s(c, e, PARAMS, args.pos, args.sampling, args.before)[0]
+        tps = 1 / engine_s(c, e, PARAMS, args.pos, args.sampling, args.before, not args.unstacked)[0]
         m = measured.get(e)
         print(f"| {e} | {tps:.1f} | {tps / cpu:.1f}x | {f'{m:.2f}' if m else '-'} |")
 
     print("\nwhere a token's time goes (ms):\n")
     for e in engines:
-        total, parts = engine_s(c, e, PARAMS, args.pos, args.sampling, args.before)
+        total, parts = engine_s(c, e, PARAMS, args.pos, args.sampling, args.before, not args.unstacked)
         print(f"  {e}: {total * 1e3:.1f} ms = " + ", ".join(f"{k} {v * 1e3:.1f}" for k, v in parts.items() if v > 5e-5))
 
 

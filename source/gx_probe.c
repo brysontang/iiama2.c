@@ -86,9 +86,9 @@ static void c0_init(s16 r, s16 g, s16 b) {
 }
 
 // The real thing: raw framebuffer copies of selftest matmuls, and repeated hashes.
-static void dump_matmul(void *gpu, const char *name, const float *x) {
+static void dump_matmul(void *gpu, const char *name, const float *x, int rows) {
     uint32_t h[3];
-    for (int r = 0; r < 3; r++) h[r] = gxm_partials_hash(gpu, x);
+    for (int r = 0; r < 3; r++) h[r] = gxm_partials_hash(gpu, x, rows);
     g_log("hash %s: %08lx %08lx %08lx\n", name, (unsigned long)h[0], (unsigned long)h[1], (unsigned long)h[2]);
     int w, hh;
     const uint8_t *buf = gxm_last_copy(&w, &hh);
@@ -105,17 +105,17 @@ static void dump_output(void *gpu, const char *name, const float *x, int rows) {
     free(y);
 }
 
-static void probe_matmuls(LlmModel *m, const float *x) {
-    if (m->layers[0].w1.gpu) {
+static void probe_matmuls(LlmModel *m, void *w1, const float *x) {
+    if (w1) {
         int hid = m->c.hidden_dim;
         gxm_set_mode(GXM_CLAMP8, 0.5f);
-        dump_matmul(m->layers[0].w1.gpu, "w1_c8", x);
-        dump_output(m->layers[0].w1.gpu, "w1_c8_y", x, hid);
+        dump_matmul(w1, "w1_c8", x, hid);
+        dump_output(w1, "w1_c8_y", x, hid);
         gxm_set_mode(GXM_EXACT11, 1.0f);
-        dump_matmul(m->layers[0].w1.gpu, "w1_e11", x);
-        dump_output(m->layers[0].w1.gpu, "w1e11_y", x, hid);
+        dump_matmul(w1, "w1_e11", x, hid);
+        dump_output(w1, "w1e11_y", x, hid);
     }
-    dump_matmul(m->cls.gpu, "cls_bl", x); // the blended classifier: one copy, one byte per row
+    dump_matmul(m->cls.gpu, "cls_bl", x, m->c.vocab_size); // the blended classifier: one copy, one byte per row
 }
 
 // Texture sampling exactly as the matmul does it: 8 planes side by side, texcoord j shifted by j/8.
@@ -354,8 +354,8 @@ static void probe_rate(LlmModel *m) {
 
 // Raw register writes vs libogc's setters: the integer sums must match, and the times show what libogc
 // cost. Layer 0's w2 (48 passes) ten times each way, in both output modes.
-static void probe_issue(LlmModel *m, const float *x) {
-    void *w1 = m->layers[0].w1.gpu, *w2 = m->layers[0].w2.gpu;
+static void probe_issue(LlmModel *m, void *w1, const float *x) {
+    void *w2 = m->layers[0].w2.gpu;
     float *y = (float *)malloc(m->c.dim * sizeof(float));
     if (!w1 || !w2 || !y) {
         free(y);
@@ -365,7 +365,7 @@ static void probe_issue(LlmModel *m, const float *x) {
         gxm_set_mode(mode ? GXM_EXACT11 : GXM_CLAMP8, mode ? 1.0f : 0.5f);
         for (int raw = 1; raw >= 0; raw--) {
             gxm_set_raw_issue(raw);
-            uint32_t h1 = gxm_partials_hash(w1, x), h2 = gxm_partials_hash(w2, x);
+            uint32_t h1 = gxm_partials_hash(w1, x, m->c.hidden_dim), h2 = gxm_partials_hash(w2, x, m->c.dim);
             GxmStats st;
             gxm_reset_stats();
             for (int i = 0; i < 10; i++) gxm_matmul(w2, y, x);
@@ -396,12 +396,17 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     int n = m->c.dim > m->c.hidden_dim ? m->c.dim : m->c.hidden_dim;
     float *x = (float *)malloc(n * sizeof(float));
     for (int j = 0; j < n; j++) x[j] = (float)(((j * 37) % 101) - 50) / 16.0f; // the selftest's input
+    // Layer 0's w1 laid out on its own, as check_probe.py expects. The engines run it stacked with w3, which
+    // gives each row the same sums in a different framebuffer layout, so then it's uploaded just for this.
+    LlmLayer *L = &m->layers[0];
+    void *w1 = L->w1.gpu ? L->w1.gpu : L->gpu_w13 ? gxm_upload(m, &L->w1, m->c.hidden_dim, m->c.dim) : NULL;
     // a line before each step, so a crash or hang shows on screen (and in probe_out.txt) where it was
     log("probe: matmuls\n");
-    if (m->cls.gpu) probe_matmuls(m, x);
+    if (m->cls.gpu) probe_matmuls(m, w1, x);
     if (gxm_tokens_failed()) log("warning: GPU draw-sync tokens timed out; matmuls fell back to GX_DrawDone\n");
     log("probe: raw issue vs libogc\n");
-    if (m->cls.gpu) probe_issue(m, x);
+    if (m->cls.gpu) probe_issue(m, w1, x);
+    if (w1 != L->w1.gpu) gxm_free(w1);
     free(x);
     log("probe: TEV arithmetic\n");
 

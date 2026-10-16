@@ -131,10 +131,10 @@ void llm_free_model(LlmModel *m) {
     if (!m->shared) free_matrix(&m->cls);
     free_matrix(&m->emb);
     free(m->rms_att); free(m->rms_ffn); free(m->rms_final);
-    free(m->x); free(m->xb); free(m->xb2); free(m->hb); free(m->hb2); free(m->q);
+    free(m->x); free(m->xb); free(m->xb2); free(m->hb); free(m->q); // hb2, k and v are in hb's and q's blocks
     free(m->att); free(m->logits); free(m->key_cache); free(m->value_cache);
     free(m->key_cache8); free(m->value_cache8); free(m->key_scale); free(m->value_scale);
-    free(m->k); free(m->v); free(m->rope);
+    free(m->rope);
     memset(m, 0, sizeof(*m));
 }
 
@@ -182,9 +182,10 @@ int llm_load_model(LlmModel *m, const char *path, LlmProgressFn progress, void *
     ALLOC(m->x, dim, "activations");
     ALLOC(m->xb, dim, "activations");
     ALLOC(m->xb2, dim, "activations");
-    ALLOC(m->hb, hid, "activations");
-    ALLOC(m->hb2, hid, "activations");
-    ALLOC(m->q, dim, "activations");
+    // hb then hb2, and for int8 models q, k, v, in one block each: the GPU's stacked matmuls write them in one go
+    ALLOC(m->hb, 2 * hid, "activations");
+    m->hb2 = m->hb + hid;
+    ALLOC(m->q, dim + (m->dtype == LLM_DTYPE_Q8 ? 2 * kv_dim : 0), "activations");
     ALLOC(m->att, (size_t)c->n_heads * c->seq_len, "attention buffer");
     ALLOC(m->logits, c->vocab_size, "logits");
     if (m->dtype == LLM_DTYPE_Q8) {
@@ -194,8 +195,8 @@ int llm_load_model(LlmModel *m, const char *path, LlmProgressFn progress, void *
             goto done;
         ALLOC(m->key_scale, L * c->seq_len * c->n_kv_heads, "KV cache");
         ALLOC(m->value_scale, L * c->seq_len * c->n_kv_heads, "KV cache");
-        ALLOC(m->k, kv_dim, "activations");
-        ALLOC(m->v, kv_dim, "activations");
+        m->k = m->q + dim;
+        m->v = m->k + kv_dim;
     } else {
         ALLOC(m->key_cache, L * c->seq_len * kv_dim, "KV cache");
         ALLOC(m->value_cache, L * c->seq_len * kv_dim, "KV cache");
@@ -421,9 +422,13 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         float *k = kv8 ? m->k : m->key_cache + loff + (size_t)pos * kv_dim;
         float *v = kv8 ? m->v : m->value_cache + loff + (size_t)pos * kv_dim;
 
-        matmul(m, m->q, m->xb, &w->wq, dim, dim);
-        matmul(m, k, m->xb, &w->wk, dim, kv_dim);
-        matmul(m, v, m->xb, &w->wv, dim, kv_dim);
+        if (m->mode == LLM_MODE_GPU && w->gpu_qkv) { // stacked (int8 only): writes q, then k and v right after it
+            m->gpu_matmul(w->gpu_qkv, m->q, m->xb);
+        } else {
+            matmul(m, m->q, m->xb, &w->wq, dim, dim);
+            matmul(m, k, m->xb, &w->wk, dim, kv_dim);
+            matmul(m, v, m->xb, &w->wv, dim, kv_dim);
+        }
 
         // RoPE
         for (int i = 0; i < dim; i += 2) {
@@ -489,8 +494,12 @@ float *llm_forward(LlmModel *m, int token, int pos) {
 
         // FFN: w2(silu(w1(x)) * w3(x))
         rmsnorm(m->xb, x, m->rms_ffn + (size_t)l * dim, dim);
-        matmul(m, m->hb, m->xb, &w->w1, dim, hidden_dim);
-        matmul(m, m->hb2, m->xb, &w->w3, dim, hidden_dim);
+        if (m->mode == LLM_MODE_GPU && w->gpu_w13) { // stacked: writes hb, then hb2 right after it
+            m->gpu_matmul(w->gpu_w13, m->hb, m->xb);
+        } else {
+            matmul(m, m->hb, m->xb, &w->w1, dim, hidden_dim);
+            matmul(m, m->hb2, m->xb, &w->w3, dim, hidden_dim);
+        }
         for (int i = 0; i < hidden_dim; i++) {
             float val = m->hb[i];
             val *= (1.0f / (1.0f + expf(-val)));
