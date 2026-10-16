@@ -314,6 +314,45 @@ static int bench_token(const char *piece, void *user) {
     return 0;
 }
 
+// Where each token's time went (LlmModel.prof), averaged like tok/s over the tokens after the first.
+// Matmuls are whole calls, on the GPU or the CPU; the rest is the CPU work between them. The last
+// line splits attention by position, since the KV cache it reads grows with every token.
+static LlmProfile g_prof;
+
+static uint32_t prof_ticks(void) { return gettick(); } // Broadway's time base, TB_TIMER_CLOCK ticks per ms
+
+static void print_profile(unsigned long gen_ms) {
+    const LlmProfile *pf = &g_prof;
+    if (pf->tokens == 0) return;
+    double ms[LLM_PROF_N], sum = 0.0;
+    for (int i = 0; i < LLM_PROF_N; i++) {
+        ms[i] = (double)pf->ticks[i] / TB_TIMER_CLOCK / pf->tokens;
+        sum += ms[i];
+    }
+#define P(part) ms[LLM_PROF_##part]
+    report("  per token (ms): matmuls %.2f (q/k/v %.2f, wo %.2f, w1/w3 %.2f, w2 %.2f, classifier %.2f), "
+           "rescore %.2f (top-k %.2f, recompute %.2f), sampling %.2f\n",
+           P(QKV) + P(WO) + P(W1W3) + P(W2) + P(CLS), P(QKV), P(WO), P(W1W3), P(W2), P(CLS),
+           P(TOPK) + P(RECOMPUTE), P(TOPK), P(RECOMPUTE), P(SAMPLE));
+    report("  per token (ms): attention %.2f (kv quant %.2f, q.k %.2f, softmax %.2f, att*v %.2f), rmsnorm %.2f, "
+           "rope %.2f (table %.2f), silu %.2f, residual %.2f, embedding %.2f | profiled %.2f of %.2f\n",
+           P(KV_QUANT) + P(SCORES) + P(SOFTMAX) + P(MIX), P(KV_QUANT), P(SCORES), P(SOFTMAX), P(MIX), P(RMSNORM),
+           P(ROPE) + P(ROPE_TABLE), P(ROPE_TABLE), P(SILU), P(RESIDUAL), P(EMBED), sum, (double)gen_ms / pf->tokens);
+#undef P
+    char line[256];
+    int n = snprintf(line, sizeof(line), "  per token (ms): attention by position");
+    for (int q = 0; q < 4; q++) { // quarters of the run, positions lo..hi
+        int lo = 1 + q * pf->tokens / 4, hi = (q + 1) * pf->tokens / 4;
+        if (hi >= LLM_PROF_MAX_POS) hi = LLM_PROF_MAX_POS - 1;
+        if (hi < lo) continue;
+        uint64_t t = 0;
+        for (int p = lo; p <= hi; p++) t += pf->attention[p];
+        n += snprintf(line + n, sizeof(line) - n, "%s %d-%d %.2f", q ? "," : "", lo, hi,
+                      (double)t / TB_TIMER_CLOCK / (hi - lo + 1));
+    }
+    report("%s\n", line);
+}
+
 static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
     char path[64];
     int steps = 64, poweroff = 0;
@@ -359,6 +398,9 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         if (!engine_ok(e)) continue;
         apply_engine(m, e);
         gxm_reset_stats();
+        memset(&g_prof, 0, sizeof(g_prof));
+        g_prof.now = prof_ticks;
+        m->prof = &g_prof;
         g_story_len = 0;
         g_story[0] = '\0';
         if (llm_init_sampler(&s, m->c.vocab_size, 0.0f, 0.9f, 1)) break;
@@ -370,8 +412,10 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         report("\n[%s] %d tokens, %lu ms total, %.2f tok/s after the first token\n", ENGINES[e].name, pos, total,
                pos > 1 && ms > 0 ? (pos - 1) * 1000.0 / ms : 0.0);
         print_gpu_stats(report);
+        print_profile(ms);
         report("  %s\n", g_story);
     }
+    m->prof = NULL;
     report("\ndone\n");
     if (g_bench_file) fclose(g_bench_file);
     g_bench_file = NULL;
