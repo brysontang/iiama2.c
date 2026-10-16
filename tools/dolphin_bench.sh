@@ -40,6 +40,8 @@ GFXBackend = Software Renderer
 EmulationSpeed = 0.00000000
 [General]
 WiiSDCardPath = $SD
+[Interface]
+UsePanicHandlers = False
 [Analytics]
 PermissionAsked = True
 Enabled = False
