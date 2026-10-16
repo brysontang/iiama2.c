@@ -10,6 +10,10 @@ Inputs a, b, c are 8-bit unsigned (Dolphin stores them in `unsigned : 8`
 bitfields, so register values wrap). d is 11-bit signed. Registers saturate to
 [-1024, 1023], or [0, 255] when the stage's clamp bit is set. The value written
 to the framebuffer is the last stage's register cast to u8 (it wraps).
+
+source/gx_probe.c confirmed all of this on a real Wii. The one place Dolphin
+and the hardware differ is outside this function: Dolphin starts each pixel's
+PREV from the GX_SetTevColor value, and the Wii doesn't reset it at all.
 """
 import numpy as np
 

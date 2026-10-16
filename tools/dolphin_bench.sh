@@ -3,6 +3,7 @@
 #
 #   tools/dolphin_bench.sh sd/llama          # folder with model.bin + tokenizer.bin
 #   tools/dolphin_bench.sh sd/llama 32       # tokens per engine (default 64)
+#   PROBE=1 tools/dolphin_bench.sh sd/llama  # GPU probes instead (gx_probe.c); keeps probe.bin
 #
 # Builds a FAT SD card image with mtools (brew install mtools), and uses a
 # throwaway Dolphin user folder so your own settings are untouched. Runs the
@@ -22,11 +23,13 @@ mkdir -p "$WORK/user/Config"
 
 # SD card: 128 MB FAT image with /llama/{model.bin, tokenizer.bin, bench.txt}
 SD="$WORK/sd.raw"
-printf 'poweroff\nsteps %s\n' "$STEPS" > "$WORK/bench.txt"
+MODE_FILE=bench.txt
+[ -n "${PROBE:-}" ] && MODE_FILE=probe.txt
+printf 'poweroff\nsteps %s\n' "$STEPS" > "$WORK/$MODE_FILE"
 dd if=/dev/zero of="$SD" bs=1048576 count=128 2>/dev/null
 mformat -i "$SD" -T 262144 -h 64 -s 32 -F ::
 mmd -i "$SD" ::/llama
-mcopy -i "$SD" "$LLAMA_DIR/model.bin" "$LLAMA_DIR/tokenizer.bin" "$WORK/bench.txt" ::/llama/
+mcopy -i "$SD" "$LLAMA_DIR/model.bin" "$LLAMA_DIR/tokenizer.bin" "$WORK/$MODE_FILE" ::/llama/
 
 cat > "$WORK/user/Config/Dolphin.ini" <<EOF
 [Core]
@@ -75,4 +78,5 @@ else
     [ -f "$LOG" ] && cat "$LOG" >&2
     exit 1
 fi
+[ -n "${PROBE:-}" ] && mcopy -i "$SD" ::/llama/probe.bin "$WORK/probe.bin"
 echo "(Dolphin files: $WORK)"

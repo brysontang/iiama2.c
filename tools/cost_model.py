@@ -1,55 +1,54 @@
 #!/usr/bin/env python3
 """
-Predicts tok/s on a real Wii for each engine in source/main.c, before anyone
-runs it on one. Dolphin can't answer this: it doesn't model Broadway's
-pipeline, caches or bus, or GPU timing at all.
+Costs each engine in source/main.c on a real Wii, fitted to one.
 
     python3 tools/cost_model.py models/stories15M.bin
     python3 tools/cost_model.py models/stories15M.bin --pos 200 --sampling
 
 Bottom-up: count the work each engine does per token, cost it with per-
-operation numbers, and add memory traffic at an effective bandwidth. Numbers
-that come from the compiled code are fixed; the ones nobody has measured get a
-pessimistic / central / optimistic range.
+operation numbers, and add memory traffic at an effective bandwidth. Dolphin
+can't answer this: it doesn't model Broadway's pipeline, caches or bus, or GPU
+timing at all.
 
-Where the fixed numbers come from (devkitPPC -O3, powerpc-eabi-objdump):
-  int8 matmul   4 MACs per loop: 4 lbz + 4 lfsx (LUT) + 4 lfs (x) = 12 loads on
+Where the numbers come from:
+  int8 matmul   from the compiled loop (devkitPPC -O3, powerpc-eabi-objdump):
+                4 MACs per loop, 4 lbz + 4 lfsx (LUT) + 4 lfs (x) = 12 loads on
                 Broadway's single load/store unit -> 3 cycles/MAC, plus about
                 8 cycles of per-group overhead every 32 MACs.
-  GPU readback  per row and pass: lbz + lfsx (LUT) + lfs (scale) -> ~3.3 cycles.
   GX issue      ~3,600 instructions per 16-column pass (Dolphin's instruction
                 count for the GX calls; libogc does read-modify-write on shadow
-                registers).
+                registers). The Wii agreed within 10%.
+  the rest      fitted to the bench on a real Wii (README, "Speed"): CPU memory
+                bandwidth, the readback loop's real cost (cache misses on the
+                framebuffer copy make it ~13 cycles per row and pass, not the
+                ~3.3 its instructions suggest), TEV rate, copy rate, sync cost.
+                Fitted totals land within 2% of the measured ones. gpu_bw never
+                limits anything here, so it's a guess.
 
-The bench mode (SD:/llama/bench.txt) prints the issue / wait / readback split
-for each engine on real hardware, which pins down the unknowns below.
-Stdlib only.
+Useful for asking what a change would buy before writing it. Stdlib only.
 """
 import argparse
 import struct
 
 CPU_HZ, GPU_HZ = 729e6, 243e6
 
-# (pessimistic, central, optimistic)
-UNKNOWN = {
-    # effective CPU streaming read bandwidth with no prefetching (in-order core,
-    # one cache line miss at a time); the 60x bus peak is 1.9 GB/s
-    "cpu_bw": (150e6, 300e6, 600e6),
-    # TEV pixel-stages per second; each stage also fetches one texel
-    "tev_rate": (243e6, 486e6, 972e6),
-    # GPU texture fetch bandwidth from main memory (weights stream, no reuse)
-    "gpu_bw": (1.5e9, 2.5e9, 3.5e9),
-    # framebuffer-to-RAM copy, pixels per second
-    "copy_rate": (121e6, 243e6, 486e6),
-    # one GX_DrawDone round trip
-    "sync_s": (40e-6, 20e-6, 8e-6),
-    # instructions per cycle for branchy glue code (norms, RoPE, GX calls)
-    "ipc": (0.7, 1.0, 1.4),
+PARAMS = {
+    "cpu_bw": 250e6,     # effective CPU streaming read bandwidth (the 60x bus peaks at 1.9 GB/s)
+    "tev_rate": 486e6,   # TEV pixel-stages per second; each stage also fetches one texel
+    "gpu_bw": 2.5e9,     # GPU texture fetch bandwidth from main memory (a guess; never the limit)
+    "copy_rate": 972e6,  # framebuffer-to-RAM copy, pixels per second
+    "sync_s": 40e-6,     # one GX_DrawDone round trip
+    "ipc": 1.0,          # instructions per cycle for branchy glue code (norms, RoPE, GX calls)
 }
+
+# What the Wii measured (SD:/llama/bench_out.txt, stories15M, 64 greedy tokens, positions 0-63)
+MEASURED = {"CPU": 7.41, "split (GPU classifier + CPU top-64)": 12.29, "GPU, fast (clamp8)": 20.55,
+            "GPU, exact (exact11)": 9.46, "GPU, exact + CPU top-64": 9.41}
 
 INT8_CYC_PER_MAC = 3.0 + 8 / 32
 ATTN_CYC_PER_MAC = 3.5   # q.k has one dependent accumulator; att*v is load/load/store
-READBACK_CYC = 3.3       # per row per pass, before memory stalls
+READBACK_CYC = 13.0      # per row per pass in clamp8 mode, fitted (cache misses included)
+READBACK_EXACT = 1.4     # exact11 reads two bytes per row and pass
 ISSUE_INSTR = {"clamp8": 3600, "exact11": 2100}  # per pass
 OTHER_INSTR = 2.5e6      # norms, RoPE trig, SiLU, residuals, embedding, greedy argmax
 SAMPLING_INSTR = 5e6     # softmax over the vocab + top-p sort, when temperature > 0
@@ -113,7 +112,7 @@ def gpu_matmul_s(mats, mode, p):
         t["sync+copy"] += batches * p["sync_s"] + passes * draws * px / p["copy_rate"]
         row_passes = rows * passes
         mem = passes * draws * px * 4 + rows * passes * 4 * cols_per_pass / 32  # framebuffer copy + scales
-        t["readback"] += row_passes * READBACK_CYC * (1 if mode == "clamp8" else 1.6) / CPU_HZ + mem / p["cpu_bw"]
+        t["readback"] += row_passes * READBACK_CYC * (1 if mode == "clamp8" else READBACK_EXACT) / CPU_HZ + mem / p["cpu_bw"]
     return sum(t.values()), t
 
 
@@ -150,25 +149,23 @@ ENGINES = ["CPU", "split (GPU classifier + CPU top-64)", "GPU, fast (clamp8)", "
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", help="llama2.c checkpoint or exported model.bin (only the header is read)")
-    ap.add_argument("--pos", type=int, default=128, help="context position to cost attention at (default 128)")
+    ap.add_argument("--pos", type=int, default=32, help="context position to cost attention at (default 32, the bench's average)")
     ap.add_argument("--sampling", action="store_true", help="include temperature sampling (the app's default)")
     args = ap.parse_args()
 
     c = read_config(args.model)
-    names = ("pessimistic", "central", "optimistic")
-    scen = [{k: v[i] for k, v in UNKNOWN.items()} for i in range(3)]
     print(f"model: dim {c['dim']}, hidden {c['hidden']}, {c['layers']} layers, vocab {c['vocab']}; "
           f"position {args.pos}, {'sampling' if args.sampling else 'greedy'}\n")
-    print("| engine | " + " | ".join(f"{n} tok/s" for n in names) + " | vs CPU (central) |")
-    print("|---|---|---|---|---|")
-    cpu_central = 1 / engine_s(c, "CPU", scen[1], args.pos, args.sampling)[0]
+    print("| engine | model tok/s | vs CPU | measured on a Wii (stories15M bench) |")
+    print("|---|---|---|---|")
+    cpu = 1 / engine_s(c, "CPU", PARAMS, args.pos, args.sampling)[0]
     for e in ENGINES:
-        tps = [1 / engine_s(c, e, s, args.pos, args.sampling)[0] for s in scen]
-        print(f"| {e} | " + " | ".join(f"{t:.1f}" for t in tps) + f" | {tps[1] / cpu_central:.1f}x |")
+        tps = 1 / engine_s(c, e, PARAMS, args.pos, args.sampling)[0]
+        print(f"| {e} | {tps:.1f} | {tps / cpu:.1f}x | {MEASURED[e]:.2f} |")
 
-    print("\nwhere a token's time goes (central, ms):\n")
+    print("\nwhere a token's time goes (ms):\n")
     for e in ENGINES:
-        total, parts = engine_s(c, e, scen[1], args.pos, args.sampling)
+        total, parts = engine_s(c, e, PARAMS, args.pos, args.sampling)
         print(f"  {e}: {total * 1e3:.1f} ms = " + ", ".join(f"{k} {v * 1e3:.1f}" for k, v in parts.items() if v > 5e-5))
 
 

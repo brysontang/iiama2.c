@@ -10,7 +10,9 @@ Layout (one draw = one "pass" over `cols` input columns):
   * The activations for the pass go in the 4 konst colors: 16 bytes, one per
     stage, picked with KCSEL K0_R..K3_A. Every row multiplies the same x, so x
     never needs to be a texture. Each pass gets its own x scale (its max |x|).
-  * Stage k:  a = HALF, b = TEXC (Wu), c = KONST (|x_k|), d = PREV,
+  * Stage k:  a = HALF, b = TEXC (Wu), c = KONST (|x_k|), d = PREV (stage 0:
+              the constant HALF or ZERO, since a real Wii doesn't reset PREV
+              between pixels),
               op = ADD if x_k >= 0 else SUB, bias = SUBHALF / ADDHALF.
     lerp(128, Wu, c) = 128 + q*c/256, and the bias cancels the 128, so each
     stage adds exactly +/- round(q * |x_k| / 256) to PREV.
@@ -19,7 +21,7 @@ Layout (one draw = one "pass" over `cols` input columns):
 
 Output modes, i.e. how each pass's 11-bit PREV gets out through 8-bit pixels:
 
-  clamp8   16 columns/pass, PREV starts at 128, last stage clamps to [0, 255].
+  clamp8   16 columns/pass, the sum starts at 128, last stage clamps to [0, 255].
            Partial sums outside [-128, 127] saturate. 1 draw per 16 columns.
   exact11  8 columns/pass, 2 draws: one writes PREV's low byte (u8 wrap), one
            runs 3 extra halving stages and writes floor(PREV/8) + 128. The CPU
@@ -90,7 +92,7 @@ class TevMatrix:
 
         last = self.cols - 1
         clamp8 = self.mode == "clamp8"
-        v = np.full((rows, self.passes), 128 if clamp8 else 0, np.int32)  # GX_SetTevColorS10(PREV)
+        v = np.full((rows, self.passes), 128 if clamp8 else 0, np.int32)  # stage 0's d: HALF or ZERO
         for k in range(self.cols):
             v = color_stage(HALF, self.wu[:, :, k], c[:, k], v, op[:, k], bias[:, k], SCALE_1,
                             clamp=clamp8 and k == last)

@@ -46,6 +46,7 @@ static int g_layout = -1;      // which static TEV setup is loaded
 static uint8_t *g_readbuf;     // framebuffer copies land here
 static float g_xscale[MAX_PASSES]; // per-pass activation scale
 static int16_t *g_partials;    // only while hashing
+static int g_last_cw, g_last_ch; // size of the latest framebuffer copy (gx_probe.c reads it)
 static size_t g_bytes;
 // framebuffer byte -> pass sum, without PowerPC's slow int-to-float conversion
 static float g_lut_c8[256], g_lut_hi[256], g_lut_lo[256];
@@ -123,7 +124,10 @@ static void load_layout(int mode) {
     for (int k = 0; k < product; k++) {
         u8 st = GX_TEVSTAGE0 + k;
         GX_SetTevOrder(st, GX_TEXCOORD0 + (k & 7), GX_TEXMAP0 + (k >> 3), GX_COLORNULL);
-        GX_SetTevColorIn(st, GX_CC_HALF, GX_CC_TEXC, GX_CC_KONST, GX_CC_CPREV);
+        // Stage 0 starts the sum from a constant: real hardware doesn't reset PREV for each pixel
+        // (it holds whatever an earlier pixel left there), so no stage may read PREV before writing it.
+        u8 d = k > 0 ? GX_CC_CPREV : mode == GXM_CLAMP8 ? GX_CC_HALF : GX_CC_ZERO;
+        GX_SetTevColorIn(st, GX_CC_HALF, GX_CC_TEXC, GX_CC_KONST, d);
         GX_SetTevKColorSel(st, GX_TEV_KCSEL_K0_R + 4 * (k & 3) + (k >> 2)); // x_k = kcolor[k/4].rgba[k%4]
         GX_SetTevAlphaIn(st, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO);
         GX_SetTevAlphaOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
@@ -143,9 +147,6 @@ static void load_layout(int mode) {
             GX_SetTevSwapMode(st, GX_TEV_SWAP0, GX_TEV_SWAP0);
         }
     }
-    s16 v = mode == GXM_CLAMP8 ? 128 : 0; // PREV's starting value in every pixel
-    GXColorS10 init = {v, v, v, v};
-    GX_SetTevColorS10(GX_TEVPREV, init);
     g_layout = mode;
 }
 
@@ -392,6 +393,8 @@ static void run(GxMat *g, float *xout, const float *x) {
         GX_DrawDone();
         uint64_t tc = gettime();
         DCInvalidateRange(g_readbuf, cw * ch * 4);
+        g_last_cw = cw;
+        g_last_ch = ch;
         if (xout) reduce_batch(g, xout, p0, np, pc, draws, slots_x, cw);
         if (g_partials) collect_partials(g, p0, np, passes, draws, slots_x, cw);
         uint64_t td = gettime();
@@ -421,6 +424,14 @@ uint32_t gxm_partials_hash(void *gpu, const float *x) {
     g_partials = NULL;
     return h;
 }
+
+const uint8_t *gxm_last_copy(int *w, int *h) {
+    *w = g_last_cw;
+    *h = g_last_ch;
+    return g_readbuf;
+}
+
+void gxm_forget_layout(void) { g_layout = -1; }
 
 void gxm_get_stats(GxmStats *out) { *out = g_stats; }
 void gxm_reset_stats(void) { memset(&g_stats, 0, sizeof(g_stats)); }

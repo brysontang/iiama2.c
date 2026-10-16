@@ -33,6 +33,11 @@ void gxm_matmul(void *gpu, float *xout, const float *x); // an LlmGpuMatmulFn
 // (row-major, int16 little-endian) for input x.
 uint32_t gxm_partials_hash(void *gpu, const float *x);
 
+// For gx_probe.c: the latest framebuffer copy (RGBA8 tiles, w x h pixels), and a way to say
+// the TEV setup was changed behind gx_matmul.c's back.
+const uint8_t *gxm_last_copy(int *w, int *h);
+void gxm_forget_layout(void);
+
 void gxm_get_stats(GxmStats *out);
 void gxm_reset_stats(void);
 

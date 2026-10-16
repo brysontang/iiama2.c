@@ -4,10 +4,11 @@
 # dependencies = ["numpy"]
 # ///
 """
-Does the real Wii build (run in Dolphin) compute what the simulator says?
+Does the Wii build compute what the simulator says, in Dolphin or on a real Wii?
 
     tools/dolphin_bench.sh sd/llama 16 > dolphin.txt
     uv run tools/tev_sim/check_dolphin.py models/stories15M.bin models/tokenizer.bin dolphin.txt
+    uv run tools/tev_sim/check_dolphin.py models/stories15M.bin models/tokenizer.bin bench_out.txt  # from a Wii
 
 Two checks, both against the bench output of source/main.c:
 
@@ -72,7 +73,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("checkpoint")
     ap.add_argument("tokenizer")
-    ap.add_argument("bench_output", help="what tools/dolphin_bench.sh printed")
+    ap.add_argument("bench_output", help="what tools/dolphin_bench.sh printed, or SD:/llama/bench_out.txt from a Wii")
     args = ap.parse_args()
 
     with open(args.bench_output) as f:
@@ -88,12 +89,12 @@ def main():
     for key, want in selftest(W).items():
         got = got_hashes.get(key)
         ok &= got == want
-        print(f"  {key[0]:8s} {key[1]:4s} sim {want}  dolphin {got}  {'OK' if got == want else 'MISMATCH'}")
+        print(f"  {key[0]:8s} {key[1]:4s} sim {want}  bench {got}  {'OK' if got == want else 'MISMATCH'}")
 
     print("\nstories")
     for name, make in ENGINES:
         if name not in got_stories:
-            print(f"  [{name}] not in the Dolphin output")
+            print(f"  [{name}] not in the bench output")
             continue
         _, want = generate(W, make(W), tok, "Once upon a time", steps)
         got = got_stories[name].rstrip()
@@ -101,7 +102,7 @@ def main():
         n = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
         print(f"  [{name}] {'IDENTICAL' if same else f'differs after {n} chars'}")
         if not same:
-            print(f"    sim:     {want!r}\n    dolphin: {got!r}")
+            print(f"    sim:     {want!r}\n    bench:   {got!r}")
     sys.exit(0 if ok else 1)
 
 

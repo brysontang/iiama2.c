@@ -27,6 +27,7 @@
 #include <wiiuse/wpad.h>
 
 #include "gx_matmul.h"
+#include "gx_probe.h"
 #include "llm.h"
 
 static void *xfb = NULL;
@@ -372,13 +373,44 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
     wait_for_home();
 }
 
-static int bench_requested(const char *root) {
+// SD:/llama/probe.txt: GPU hardware probes (gx_probe.c), to SD:/llama/probe.bin + probe_out.txt.
+static int file_exists(const char *root, const char *name) {
     char path[64];
-    snprintf(path, sizeof(path), "%s/llama/bench.txt", root);
+    snprintf(path, sizeof(path), "%s/llama/%s", root, name);
     FILE *f = fopen(path, "r");
     if (f) fclose(f);
     return f != NULL;
 }
+
+static int bench_requested(const char *root) { return file_exists(root, "bench.txt"); }
+
+static void run_probe(LlmModel *m, const char *root) {
+    char path[64];
+    int poweroff = 0;
+    snprintf(path, sizeof(path), "%s/llama/probe.txt", root);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[64];
+        while (fgets(line, sizeof(line), f))
+            if (strncmp(line, "poweroff", 8) == 0) poweroff = 1;
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s/llama/probe_out.txt", root);
+    g_bench_file = fopen(path, "w");
+    clear_screen();
+    report("iiama2.c GPU probe\n%s\n", g_gpu_note);
+    if (g_gpu_cls) {
+        snprintf(path, sizeof(path), "%s/llama/probe.bin", root);
+        gxp_run(m, path, report);
+    }
+    report("\nprobe done\n");
+    if (g_bench_file) fclose(g_bench_file);
+    g_bench_file = NULL;
+    if (bench_requested(root)) return; // the bench runs next
+    if (poweroff) SYS_ResetSystem(SYS_POWEROFF, 0, 0);
+    wait_for_home();
+}
+
 
 // autoplay.txt: optional "engine N", "prompt N" and "temp X" lines (indexes into ENGINES and PROMPTS), and
 // "screenshot" to save one as soon as the story ends.
@@ -421,6 +453,7 @@ int main(int argc, char **argv) {
         }
     }
     setup_gpu(&model);
+    if (file_exists(root, "probe.txt")) run_probe(&model, root);
     if (bench_requested(root)) run_bench(&model, &tok, root);
 
     int prompt_idx = 0, engine = 0;
