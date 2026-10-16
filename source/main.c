@@ -27,6 +27,7 @@
 #include <ogc/lwp_watchdog.h>
 #include <wiiuse/wpad.h>
 
+#include "dsp_probe.h"
 #include "gx_matmul.h"
 #include "gx_probe.h"
 #include "llm.h"
@@ -458,6 +459,7 @@ static void run_probe(LlmModel *m, const char *root) {
         snprintf(path, sizeof(path), "%s/llama/probe.bin", root);
         gxp_run(m, path, report);
     }
+    dsp_probe_run(m, report); // last, so a hang there can't cost the GPU results
     report("\nprobe done\n");
     if (g_bench_file) fclose(g_bench_file);
     g_bench_file = NULL;

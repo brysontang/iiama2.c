@@ -3,11 +3,14 @@
 #
 #   tools/dolphin_bench.sh sd/llama          # folder with model.bin + tokenizer.bin
 #   tools/dolphin_bench.sh sd/llama 32       # tokens per engine (default 64)
-#   PROBE=1 tools/dolphin_bench.sh sd/llama  # GPU probes instead (gx_probe.c); keeps probe.bin
+#   PROBE=1 tools/dolphin_bench.sh sd/llama  # GPU and DSP probes instead (gx_probe.c, dsp_probe.c);
+#                                            # keeps probe.bin and probe_out.txt
 #
 # Builds a FAT SD card image with mtools (brew install mtools), and uses a
 # throwaway Dolphin user folder so your own settings are untouched. Runs the
-# software renderer, whose TEV math is what tools/tev_sim copies.
+# software renderer, whose TEV math is what tools/tev_sim copies. The probes also
+# run the DSP in low-level emulation (interpreter, with Dolphin's own boot ROM from
+# Sys/GC), since high-level emulation only knows Nintendo's microcode.
 #
 # Speed numbers from Dolphin mean nothing; compare the text and the selftest
 # hashes against tools/tev_sim/check_dolphin.py instead.
@@ -26,6 +29,12 @@ SD="$WORK/sd.raw"
 MODE_FILE=bench.txt
 [ -n "${PROBE:-}" ] && MODE_FILE=probe.txt
 printf 'poweroff\nsteps %s\n' "$STEPS" > "$WORK/$MODE_FILE"
+DSP_CORE= DSP_JIT= DSP_LOG=
+if [ -n "${PROBE:-}" ]; then
+    DSP_CORE="DSPHLE = False"
+    DSP_JIT="EnableJIT = False"
+    DSP_LOG="DSPLLE = True"
+fi
 dd if=/dev/zero of="$SD" bs=1048576 count=128 2>/dev/null
 mformat -i "$SD" -T 262144 -h 64 -s 32 -F ::
 mmd -i "$SD" ::/llama
@@ -38,6 +47,7 @@ WiiSDCardAllowWrites = True
 WiiSDCardEnableFolderSync = False
 GFXBackend = Software Renderer
 EmulationSpeed = 0.00000000
+$DSP_CORE
 [General]
 WiiSDCardPath = $SD
 [Interface]
@@ -47,6 +57,7 @@ PermissionAsked = True
 Enabled = False
 [DSP]
 Backend = No Audio Output
+$DSP_JIT
 EOF
 cat > "$WORK/user/Config/Logger.ini" <<EOF
 [Options]
@@ -57,6 +68,7 @@ WriteToWindow = False
 [Logs]
 OSREPORT = True
 OSREPORT_HLE = True
+$DSP_LOG
 EOF
 
 "$DOLPHIN" -u "$WORK/user" -b -e "$DOL" > "$WORK/stdout.txt" 2>&1 &
@@ -80,5 +92,5 @@ else
     [ -f "$LOG" ] && cat "$LOG" >&2
     exit 1
 fi
-[ -n "${PROBE:-}" ] && mcopy -i "$SD" ::/llama/probe.bin "$WORK/probe.bin"
+[ -n "${PROBE:-}" ] && mcopy -i "$SD" ::/llama/probe.bin ::/llama/probe_out.txt "$WORK/"
 echo "(Dolphin files: $WORK)"
