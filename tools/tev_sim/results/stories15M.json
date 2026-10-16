@@ -11,50 +11,50 @@
   "f32": {
    "top1": 1.0,
    "kl": 0.0,
-   "ppl": 2.7681331826553475,
+   "ppl": 2.7103156064729594,
    "positions": 1154,
    "saturation": {},
    "label": "fp32 CPU"
   },
   "q8": {
-   "top1": 0.9844020797227037,
-   "kl": 0.0006754056012409829,
-   "ppl": 2.771569321583488,
+   "top1": 0.9852686308492201,
+   "kl": 0.0006867287276267471,
+   "ppl": 2.7155554583923127,
    "positions": 1154,
    "saturation": {},
    "label": "int8 CPU (the Wii today)"
   },
   "split:blend:16:0.25:256": {
-   "top1": 0.9844020797227037,
-   "kl": 0.004700573707078823,
-   "ppl": 2.7773899828448823,
+   "top1": 0.9852686308492201,
+   "kl": 0.004732994627811964,
+   "ppl": 2.7212408900408835,
    "positions": 1154,
    "saturation": {
-    "cls": 0.06926064233102253
+    "cls": 0.07083337846620451
    },
    "label": "split (blend/16 cols, headroom 0.25, CPU top-256)"
   },
   "gpu+blend:clamp8+rows:16:0.5:256": {
-   "top1": 0.9306759098786829,
-   "kl": 0.028367420006087583,
-   "ppl": 2.8493309188474782,
+   "top1": 0.9272097053726169,
+   "kl": 0.029319853962047854,
+   "ppl": 2.8086130068261066,
    "positions": 1154,
    "saturation": {
-    "wq": 0.0029657032525978702,
-    "wk": 0.0028791150034590722,
-    "wv": 0.00253674595787777,
-    "wo": 0.0026462628199641967,
-    "w1": 0.0031176993401908553,
-    "w2": 0.00019896074041979587,
-    "w3": 0.0030004061122611636,
-    "cls": 0.06460907712305027
+    "wq": 0.002961942180000143,
+    "wk": 0.0028788085456918503,
+    "wv": 0.002526465692777314,
+    "wo": 0.0026778279699880892,
+    "w1": 0.0031229961840993216,
+    "w2": 0.00020068456536042107,
+    "w3": 0.00300639248614588,
+    "cls": 0.06502112218370884
    },
    "label": "GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256"
   },
   "gpu+blend:exact11:8:1.0:256": {
-   "top1": 0.9714038128249567,
-   "kl": 0.005610852913442496,
-   "ppl": 2.7808918236453195,
+   "top1": 0.975736568457539,
+   "kl": 0.0056704305799209435,
+   "ppl": 2.7277777932735288,
    "positions": 1154,
    "saturation": {
     "wq": 0.0,
@@ -64,24 +64,24 @@
     "w1": 0.0,
     "w2": 0.0,
     "w3": 0.0,
-    "cls": 0.0694181379982669
+    "cls": 0.06964736785095321
    },
    "label": "GPU only (exact11/8 cols, headroom 1.0), blended classifier + CPU top-256"
   },
   "gpu+blend:clamp8:16:0.5:256": {
-   "top1": 0.9055459272097054,
-   "kl": 0.03933437575379592,
-   "ppl": 2.8791056562637665,
+   "top1": 0.915944540727903,
+   "kl": 0.03929495375611655,
+   "ppl": 2.82137445629578,
    "positions": 1154,
    "saturation": {
-    "wq": 0.01819169523967449,
-    "wk": 0.018146116611749436,
-    "wv": 0.015995173123007467,
-    "wo": 0.017185594389883818,
-    "w1": 0.018192360392328348,
-    "w2": 0.0047716101201938504,
-    "w3": 0.017974803237397564,
-    "cls": 0.06399937716637781
+    "wq": 0.018164782675752972,
+    "wk": 0.018152385066078983,
+    "wv": 0.015976144881642666,
+    "wo": 0.017200304362710486,
+    "w1": 0.018239948408113486,
+    "w2": 0.004753149522193337,
+    "w3": 0.018021628591239274,
+    "cls": 0.06635390489601387
    },
    "label": "GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256"
   }
@@ -93,30 +93,30 @@
  "classifier": {
   "blend:16:0.25": {
    "recall": {
-    "1": 0.7391681109185442,
-    "4": 0.9540727902946274,
+    "1": 0.7313691507798961,
+    "4": 0.951473136915078,
     "16": 0.9982668977469671,
     "64": 1.0
    },
-   "nucleus_in_top64": 0.9458541815582558
+   "nucleus_in_top64": 0.9390353236507083
   },
   "clamp8:16:0.5": {
    "recall": {
-    "1": 0.9228769497400346,
+    "1": 0.9194107452339688,
     "4": 0.9991334488734835,
     "16": 1.0,
     "64": 1.0
    },
-   "nucleus_in_top64": 0.978734810578985
+   "nucleus_in_top64": 0.9722072798995876
   },
   "exact11:8:1.0": {
    "recall": {
-    "1": 0.9904679376083189,
+    "1": 0.9913344887348353,
     "4": 1.0,
     "16": 1.0,
     "64": 1.0
    },
-   "nucleus_in_top64": 0.9805218012866334
+   "nucleus_in_top64": 0.9743589743589743
   }
  },
  "greedy": {
@@ -159,13 +159,13 @@
   "gpu+blend:clamp8+rows:16:0.5:256": [
    {
     "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play with her toys and her friends. One day, Lily's mom asked her to help with the laundry. Lily didn't want to help because she wanted to play with her toys. But her mom said, \"Lily, you need to help me with the laundry. It will be fun!\"\nLily started to help her mom with the laundry. She put the clothes in the washing machine and added soap. Then, her mom asked her",
-    "diverges_from_q8_at": 19
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red apple on the ground. She picked it up and took a bite. It was so juicy and delicious!\nLily's mom came outside and saw her eating the apple. \"What are you doing, Lily?\" she asked. \"I found a big, red apple,\" Lily replied. \"Can I have a bite?\" her mom asked. \"Sure!\" Lily said.\n",
+    "diverges_from_q8_at": 35
    },
    {
     "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking in the forest. He was looking for something to eat. Suddenly, he saw a big, juicy apple. He was so excited that he started to eat it right away.\nThe king said, \"This apple is so yummy! I will eat it all!\"\nBut then he heard a voice. It was a little rabbit. The rabbit said, \"Please don't eat me! I am so hungry!\"\nThe king was surprised. He said, \"I am sorry, little rabbit. I",
-    "diverges_from_q8_at": 17
+    "text": "The grumpy turtle king was walking in the forest. He was very tired and wanted to rest. He saw a big tree and decided to rest under it. The tree was very tall and had many leaves. The king sat down and closed his eyes.\nSuddenly, he heard a loud noise. It was a big bird who wanted to eat the king. The king woke up and saw the bird. He was very scared and tried to run away, but the bird was too fast. The bird caught the king and ate him. The end.",
+    "diverges_from_q8_at": null
    }
   ],
   "gpu+blend:exact11:8:1.0:256": [
@@ -183,13 +183,13 @@
   "gpu+blend:clamp8:16:0.5:256": [
    {
     "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. She knew that meant rain was coming. \nLily ran inside her house and told her mommy about the rain. Her mommy said, \"Let's make some hot chocolate to warm up!\" Lily was excited and helped her mommy make the hot chocolate. \nAs they sipped their hot chocolate, Lily said, \"I love playing outside",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. She knew that meant rain was coming. \nLily ran inside her house and told her mommy about the rain. Her mommy said, \"Let's make some hot chocolate to warm up!\" They went to the kitchen and made hot chocolate. It was so yummy! \nAfter they finished their hot chocolate, Lily's mommy said,",
     "diverges_from_q8_at": 34
    },
    {
     "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a big, shiny object in the sand. He bent down and picked it up. It was a shiny, round object. He was so excited! He wanted to show it to his friends.\nThe king said, \"Let's go and show everyone this shiny object!\" So the king and his friends went to the beach. When they got there, they saw a big, shiny object. It was a big, round, and",
-    "diverges_from_q8_at": 11
+    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of treasure. Suddenly, he heard a loud noise. He looked up and saw a big bird flying in the sky. The bird was carrying something in its beak.\nThe king was very angry. He shouted at the bird and said, \"What are you doing with my treasure?\" The bird replied, \"I'm going to give it to my friend. He will be very happy.\"\nThe king was very angry. He shouted, \"No! You",
+    "diverges_from_q8_at": 17
    }
   ]
  }

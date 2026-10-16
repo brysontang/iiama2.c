@@ -8,20 +8,20 @@ recall@K is how often the int8 CPU's best token lands in the TEV's top K.
 
 | TEV classifier | recall@1 | @4 | @16 | @64 | top-p nucleus in top 64 |
 |---|---|---|---|---|---|
-| blend:16:0.25 | 73.9% | 95.4% | 99.8% | 100.0% | 94.6% |
-| clamp8:16:0.5 | 92.3% | 99.9% | 100.0% | 100.0% | 97.9% |
-| exact11:8:1.0 | 99.0% | 100.0% | 100.0% | 100.0% | 98.1% |
+| blend:16:0.25 | 73.1% | 95.1% | 99.8% | 100.0% | 93.9% |
+| clamp8:16:0.5 | 91.9% | 99.9% | 100.0% | 100.0% | 97.2% |
+| exact11:8:1.0 | 99.1% | 100.0% | 100.0% | 100.0% | 97.4% |
 
 ## End to end, teacher-forced against fp32
 
 | backend | top-1 vs fp32 | KL (nats) | ppl | TEV saturation |
 |---|---|---|---|---|
-| fp32 CPU | 100.0% | 0.0000 | 2.77 | - |
-| int8 CPU (the Wii today) | 98.4% | 0.0007 | 2.77 | - |
-| split (blend/16 cols, headroom 0.25, CPU top-256) | 98.4% | 0.0047 | 2.78 | cls 6.93% |
-| GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256 | 93.1% | 0.0284 | 2.85 | wq 0.30%, wk 0.29%, wv 0.25%, wo 0.26%, w1 0.31%, w2 0.02%, w3 0.30%, cls 6.46% |
-| GPU only (exact11/8 cols, headroom 1.0), blended classifier + CPU top-256 | 97.1% | 0.0056 | 2.78 | wq 0.00%, wk 0.00%, wv 0.00%, wo 0.00%, w1 0.00%, w2 0.00%, w3 0.00%, cls 6.94% |
-| GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256 | 90.6% | 0.0393 | 2.88 | wq 1.82%, wk 1.81%, wv 1.60%, wo 1.72%, w1 1.82%, w2 0.48%, w3 1.80%, cls 6.40% |
+| fp32 CPU | 100.0% | 0.0000 | 2.71 | - |
+| int8 CPU (the Wii today) | 98.5% | 0.0007 | 2.72 | - |
+| split (blend/16 cols, headroom 0.25, CPU top-256) | 98.5% | 0.0047 | 2.72 | cls 7.08% |
+| GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256 | 92.7% | 0.0293 | 2.81 | wq 0.30%, wk 0.29%, wv 0.25%, wo 0.27%, w1 0.31%, w2 0.02%, w3 0.30%, cls 6.50% |
+| GPU only (exact11/8 cols, headroom 1.0), blended classifier + CPU top-256 | 97.6% | 0.0057 | 2.73 | wq 0.00%, wk 0.00%, wv 0.00%, wo 0.00%, w1 0.00%, w2 0.00%, w3 0.00%, cls 6.96% |
+| GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256 | 91.6% | 0.0393 | 2.82 | wq 1.82%, wk 1.82%, wv 1.60%, wo 1.72%, w1 1.82%, w2 0.48%, w3 1.80%, cls 6.64% |
 
 ## Greedy stories
 
@@ -51,11 +51,11 @@ recall@K is how often the int8 CPU's best token lands in the TEV's top K.
 >
 > Lily found a stick and tried to reach the ball. She poked the
 
-**GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256** (diverges from int8 CPU at token 19)
+**GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256** (diverges from int8 CPU at token 35)
 
-> Once upon a time, there was a little girl named Lily. She loved to play with her toys and her friends. One day, Lily's mom asked her to help with the laundry. Lily didn't want to help because she wanted to play with her toys. But her mom said, "Lily, you need to help me with the laundry. It will be fun!"
+> Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red apple on the ground. She picked it up and took a bite. It was so juicy and delicious!
 >
-> Lily started to help her mom with the laundry. She put the clothes in the washing machine and added soap. Then, her mom asked her
+> Lily's mom came outside and saw her eating the apple. "What are you doing, Lily?" she asked. "I found a big, red apple," Lily replied. "Can I have a bite?" her mom asked. "Sure!" Lily said.
 
 **GPU only (exact11/8 cols, headroom 1.0), blended classifier + CPU top-256** (diverges from int8 CPU at token 55)
 
@@ -69,9 +69,9 @@ recall@K is how often the int8 CPU's best token lands in the TEV's top K.
 
 > Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. She knew that meant rain was coming. 
 >
-> Lily ran inside her house and told her mommy about the rain. Her mommy said, "Let's make some hot chocolate to warm up!" Lily was excited and helped her mommy make the hot chocolate. 
+> Lily ran inside her house and told her mommy about the rain. Her mommy said, "Let's make some hot chocolate to warm up!" They went to the kitchen and made hot chocolate. It was so yummy! 
 >
-> As they sipped their hot chocolate, Lily said, "I love playing outside
+> After they finished their hot chocolate, Lily's mommy said,
 
 ### "The grumpy turtle king"
 
@@ -95,15 +95,11 @@ recall@K is how often the int8 CPU's best token lands in the TEV's top K.
 >
 > Suddenly, he heard a loud noise. It was a big bird who wanted to eat the king. The king woke up and saw the bird. He was very scared and tried to run away, but the bird was too fast. The bird caught the king and ate him. The end.
 
-**GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256** (diverges from int8 CPU at token 17)
+**GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256** (same as int8 CPU)
 
-> The grumpy turtle king was walking in the forest. He was looking for something to eat. Suddenly, he saw a big, juicy apple. He was so excited that he started to eat it right away.
+> The grumpy turtle king was walking in the forest. He was very tired and wanted to rest. He saw a big tree and decided to rest under it. The tree was very tall and had many leaves. The king sat down and closed his eyes.
 >
-> The king said, "This apple is so yummy! I will eat it all!"
->
-> But then he heard a voice. It was a little rabbit. The rabbit said, "Please don't eat me! I am so hungry!"
->
-> The king was surprised. He said, "I am sorry, little rabbit. I
+> Suddenly, he heard a loud noise. It was a big bird who wanted to eat the king. The king woke up and saw the bird. He was very scared and tried to run away, but the bird was too fast. The bird caught the king and ate him. The end.
 
 **GPU only (exact11/8 cols, headroom 1.0), blended classifier + CPU top-256** (diverges from int8 CPU at token 17)
 
@@ -113,8 +109,10 @@ recall@K is how often the int8 CPU's best token lands in the TEV's top K.
 >
 > The king's father came to the forest and saw the king crying. He asked the
 
-**GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256** (diverges from int8 CPU at token 11)
+**GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256** (diverges from int8 CPU at token 17)
 
-> The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a big, shiny object in the sand. He bent down and picked it up. It was a shiny, round object. He was so excited! He wanted to show it to his friends.
+> The grumpy turtle king was walking in the forest. He was carrying a big bag of treasure. Suddenly, he heard a loud noise. He looked up and saw a big bird flying in the sky. The bird was carrying something in its beak.
 >
-> The king said, "Let's go and show everyone this shiny object!" So the king and his friends went to the beach. When they got there, they saw a big, shiny object. It was a big, round, and
+> The king was very angry. He shouted at the bird and said, "What are you doing with my treasure?" The bird replied, "I'm going to give it to my friend. He will be very happy."
+>
+> The king was very angry. He shouted, "No! You

@@ -102,15 +102,15 @@ stories15M, 1,154 positions of fp32-sampled stories replayed through each engine
 
 | Engine | Top-1 agrees with fp32 | KL vs fp32 (nats) | Perplexity |
 |---|---|---|---|
-| fp32 CPU | 100% | 0 | 2.77 |
-| int8 CPU | 98.4% | 0.0007 | 2.77 |
-| split | 98.4% | 0.0047 | 2.78 |
-| GPU, fast | 93.1% | 0.028 | 2.85 |
-| GPU, exact | 97.1% | 0.0056 | 2.78 |
+| fp32 CPU | 100% | 0 | 2.71 |
+| int8 CPU | 98.5% | 0.0007 | 2.72 |
+| split | 98.5% | 0.0047 | 2.72 |
+| GPU, fast | 92.7% | 0.029 | 2.81 |
+| GPU, exact | 97.6% | 0.0057 | 2.73 |
 
-The split engine matches int8 CPU on top-1 and tells the same greedy stories: the true best token was inside the blended output layer's top 64 at all 1,154 positions. KL is higher than int8's because tokens outside the top 256 keep their coarse logits. At the app's sampling settings (temperature 0.8, top-p 0.9), the sampling distribution sits as close to fp32's as int8 CPU's does (total variation 0.012 for both; `tools/tev_sim/blend_sweep.py` has the sampler). GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical. Before its layers got per-row scales, GPU fast scored 90.6% and 0.039.
+The split engine matches int8 CPU on top-1 and tells the same greedy stories: the true best token was inside the blended output layer's top 64 at all 1,154 positions. KL is higher than int8's because tokens outside the top 256 keep their coarse logits. At the app's sampling settings (temperature 0.8, top-p 0.9), the sampling distribution sits as close to fp32's as int8 CPU's does (total variation 0.012 for both; `tools/tev_sim/blend_sweep.py` has the sampler). GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical. Before its layers got per-row scales, GPU fast scored 91.6% and 0.039.
 
-The int8 KV cache and the 16-bit output layer barely register: int8 CPU's KL went from 0.0005 to 0.0007 and GPU fast's from 0.027 to 0.028, and the 16-bit output layer leaves split's numbers where 8-bit textures had them (KL 0.0047 vs 0.0048).
+The engine computes `exp` itself now (see [below](#speed-on-a-real-wii)), and the simulator samples its reference stories with the same softmax, so those stories and their perplexities shifted a little with it (fp32's was 2.77). The int8 KV cache and the 16-bit output layer barely registered either: int8 CPU's KL went from 0.0005 to 0.0007 and GPU fast's from 0.027 to 0.028, and the 16-bit output layer leaves split's numbers where 8-bit textures had them (KL 0.0047 vs 0.0048).
 
 ### Speed on a real Wii
 
