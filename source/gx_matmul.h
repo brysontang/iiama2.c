@@ -53,6 +53,16 @@ int gxm_tokens_failed(void); // draw-sync tokens timed out, so matmuls fell back
 // memory read as another format no bigger), one small texture over and over (tiny), or none (fmt < 0).
 const void *gxm_texture_memory(void *gpu, size_t *bytes);
 float gxm_time_draws(void *gpu, int stages, int fmt, int tiny);
+// Probe: one matrix (or n stacked, like the engines' wq|wk|wv) uploaded with pass regions pw pixels wide
+// (blend: as the output layer, else as GPU fast's per-row textures), timed drawing every pass alone and as a
+// whole matmul in the current mode, with the GPU's texture counters for the draws. Freed afterwards.
+typedef struct {
+    int pw, ph;
+    float draw_ms, matmul_ms;
+    uint32_t hash, clocks, texels, tc_misses, tx_memstall;
+} GxmShape;
+int gxm_probe_shape(const LlmModel *m, const LlmMatrix *const *w, const int *rows, int n, int cols, int pw, int blend,
+                    const float *x, GxmShape *out);
 
 void gxm_get_stats(GxmStats *out);
 void gxm_reset_stats(void);

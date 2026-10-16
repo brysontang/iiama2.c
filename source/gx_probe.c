@@ -381,6 +381,48 @@ static void probe_issue(LlmModel *m, void *w1, const float *x) {
     free(y);
 }
 
+// The same matrices in other pass-region shapes. Every region so far was 4 pixels tall: w2 (24x4) drew at
+// about 63 ns per pixel and pass on a Wii, and stacked w1|w3 (128x4) at 151, 3-4x slower than its pixels
+// and texels explain. Each shape gives the same sums (the hash), so this only asks which layout the GPU
+// and the readback like, and the texture counters say whether the texture cache is why.
+static void probe_shapes(LlmModel *m, const float *x) {
+    const LlmConfig *c = &m->c;
+    LlmLayer *L = &m->layers[0];
+    int dim = c->dim, hid = c->hidden_dim, kv = c->dim * c->n_kv_heads / c->n_heads;
+    static const int widths[] = {128, 116, 72, 64, 32, 24, 16, 8, 4};
+    struct {
+        const char *name;
+        const LlmMatrix *w[3];
+        int rows[3], n, cols, blend;
+    } mats[] = {
+        {"w1|w3", {&L->w1, &L->w3}, {hid, hid}, 2, dim, 0},
+        {"w1", {&L->w1}, {hid}, 1, dim, 0},
+        {"q|k|v", {&L->wq, &L->wk, &L->wv}, {dim, kv, kv}, 3, dim, 0},
+        {"w2", {&L->w2}, {dim}, 1, hid, 0},
+        {"cls", {&m->cls}, {c->vocab_size}, 1, dim, 1},
+    };
+    gxm_set_mode(GXM_CLAMP8, 0.5f);
+    for (size_t i = 0; i < sizeof(mats) / sizeof(mats[0]); i++) {
+        int rows = 0;
+        for (int k = 0; k < mats[i].n; k++) rows += mats[i].rows[k];
+        int npx = (rows + 2) / 3;
+        for (size_t j = 0; j < sizeof(widths) / sizeof(widths[0]); j++) {
+            int pw = widths[j], ph = ((npx + pw - 1) / pw + 3) & ~3;
+            if (ph > 480 || pw * ph > npx * 5 / 4 + 16) continue; // too tall, or mostly padding
+            if (mats[i].blend && pw < 32) continue;                // 6 MB each; the narrow ones say enough
+            GxmShape r;
+            if (gxm_probe_shape(m, mats[i].w, mats[i].rows, mats[i].n, mats[i].cols, pw, mats[i].blend, x, &r)) {
+                g_log("shape %-5s %3dx%-3d: upload failed\n", mats[i].name, pw, ph);
+                continue;
+            }
+            g_log("shape %-5s %3dx%-3d: draws %6.3f ms, matmul %6.3f ms | %lu texels, %lu tex misses, %lu stalled "
+                  "of %lu clocks | %08lx\n", mats[i].name, r.pw, r.ph, r.draw_ms, r.matmul_ms, (unsigned long)r.texels,
+                  (unsigned long)r.tc_misses, (unsigned long)r.tx_memstall, (unsigned long)r.clocks,
+                  (unsigned long)r.hash);
+        }
+    }
+}
+
 int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     g_log = log;
     g_out = fopen(bin_path, "wb");
@@ -407,7 +449,6 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     log("probe: raw issue vs libogc\n");
     if (m->cls.gpu) probe_issue(m, w1, x);
     if (w1 != L->w1.gpu) gxm_free(w1);
-    free(x);
     log("probe: TEV arithmetic\n");
 
     probe_texture();
@@ -422,6 +463,9 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     probe_rate(m);
     log("probe: memory\n");
     probe_memory(m);
+    log("probe: region shapes\n");
+    probe_shapes(m, x);
+    free(x);
 
     fclose(g_out);
     free(g_buf);

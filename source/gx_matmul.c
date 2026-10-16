@@ -238,6 +238,8 @@ static uint8_t wu(const GxMat *g, const Stack *w, int row, int col) {
     return (uint8_t)(q + 128);
 }
 
+static int g_force_pw; // probe only (gxm_probe_shape): pass regions this wide, a multiple of 4 up to PLANE_W_MAX
+
 static GxMat *upload(const LlmModel *m, const Stack *w, int cols, int kind) {
     int rows = 0;
     for (int i = 0; i < w->n; i++) rows += w->rows[i];
@@ -257,6 +259,11 @@ static GxMat *upload(const LlmModel *m, const Stack *w, int cols, int kind) {
     for (int ph = 4; ph <= EFB_H; ph += 4) {
         int pw = ((g->npx + ph - 1) / ph + 3) & ~3;
         if (pw <= PLANE_W_MAX && (g->pw == 0 || pw * ph < g->pw * g->ph)) { g->pw = pw; g->ph = ph; }
+    }
+    if (g_force_pw) { // probe: a given width instead
+        g->pw = g_force_pw;
+        g->ph = ((g->npx + g->pw - 1) / g->pw + 3) & ~3;
+        if (g->ph > EFB_H) g->pw = 0;
     }
     g->ntex = cols / PLANES;
     int tw = PLANES * g->pw;
@@ -367,6 +374,8 @@ void gxm_free(void *gpu) {
     free(g);
 }
 
+static int g_stack = 0; // stack wq|wk|wv and w1|w3 (see below)
+
 int gxm_upload_model(LlmModel *m, int layers, size_t *bytes) {
     LlmConfig *c = &m->c;
     int dim = c->dim, hid = c->hidden_dim, kv = c->dim * c->n_kv_heads / c->n_heads;
@@ -376,11 +385,12 @@ int gxm_upload_model(LlmModel *m, int layers, size_t *bytes) {
     if (!m->cls.gpu && !(m->cls.gpu = upload(m, &cls, dim, SCALES_BLEND))) rc = -1;
     for (int l = 0; rc == 0 && layers && l < c->n_layers; l++) {
         LlmLayer *L = &m->layers[l];
-        // wq, wk, wv multiply the same x, and so do w1, w3: each group goes up stacked, or if that doesn't
-        // fit, one matrix at a time
+        // wq, wk, wv multiply the same x, and so do w1, w3: each group can go up stacked, or if that doesn't
+        // fit, one matrix at a time. Off for now: on a Wii, stacked w1|w3 (128x4-pixel regions) drew 3-4x
+        // slower per pixel than w2 (24x4), which cost more than the draws it saved (gxm_probe_shape measures).
         Stack qkv = {3, {dim, kv, kv}, {&L->wq, &L->wk, &L->wv}}, w13 = {2, {hid, hid}, {&L->w1, &L->w3}};
-        if (!L->gpu_qkv && !L->wq.gpu) L->gpu_qkv = upload_layer(m, &qkv, dim);
-        if (!L->gpu_w13 && !L->w1.gpu) L->gpu_w13 = upload_layer(m, &w13, dim);
+        if (g_stack && !L->gpu_qkv && !L->wq.gpu) L->gpu_qkv = upload_layer(m, &qkv, dim);
+        if (g_stack && !L->gpu_w13 && !L->w1.gpu) L->gpu_w13 = upload_layer(m, &w13, dim);
         struct { LlmMatrix *w; int rows, cols; void *stack; } mats[7] = {
             {&L->wq, dim, dim, L->gpu_qkv}, {&L->wk, kv, dim, L->gpu_qkv}, {&L->wv, kv, dim, L->gpu_qkv},
             {&L->wo, dim, dim, NULL},       {&L->w1, hid, dim, L->gpu_w13}, {&L->w2, dim, hid, NULL},
@@ -914,6 +924,48 @@ float gxm_time_draws(void *gpu, int stages, int fmt, int tiny) {
     GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
     g_layout = -1;
     return ticks_to_microsecs(t1 - t0) / 1000.0f;
+}
+
+int gxm_probe_shape(const LlmModel *m, const LlmMatrix *const *w, const int *rows, int n, int cols, int pw, int blend,
+                    const float *x, GxmShape *out) {
+    Stack st = {n, {0}, {NULL}};
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        st.rows[i] = rows[i];
+        st.w[i] = w[i];
+        total += rows[i];
+    }
+    g_force_pw = pw;
+    GxMat *g = blend ? upload(m, &st, cols, SCALES_BLEND) : upload_layer(m, &st, cols);
+    g_force_pw = 0;
+    GxMat *d = g && !blend ? g->per_row : g; // what GPU fast draws
+    float *y = (float *)malloc(total * sizeof(float));
+    if (!d || !y) {
+        gxm_free(g);
+        free(y);
+        return -1;
+    }
+    out->pw = d->pw;
+    out->ph = d->ph;
+    // the same draws three times, each with a different texture counter next to the GPU clock count
+    static const u32 perf1[3] = {GX_PERF1_TEXELS, GX_PERF1_TC_MISS, GX_PERF1_TX_MEMSTALL};
+    u32 *got[3] = {&out->texels, &out->tc_misses, &out->tx_memstall};
+    for (int k = 0; k < 3; k++) {
+        GX_SetGPMetric(GX_PERF0_CLOCKS, perf1[k]);
+        GX_ClearGPMetric();
+        out->draw_ms = gxm_time_draws(d, 16, d->fmt, 0);
+        GX_ReadGPMetric(&out->clocks, got[k]);
+    }
+    GX_SetGPMetric(GX_PERF0_NONE, GX_PERF1_NONE);
+    gxm_forget_layout();
+    run(g, y, x); // once to warm up, then timed
+    uint64_t t0 = gettime();
+    for (int r = 0; r < 5; r++) run(g, y, x);
+    out->matmul_ms = ticks_to_microsecs(gettime() - t0) / 5000.0f;
+    out->hash = gxm_partials_hash(g, x, total);
+    gxm_free(g);
+    free(y);
+    return 0;
 }
 
 void gxm_forget_layout(void) { g_layout = -1; }
