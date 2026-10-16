@@ -260,6 +260,14 @@ static GxMat *upload(const LlmModel *m, const Stack *w, int cols, int kind) {
         int pw = ((g->npx + ph - 1) / ph + 3) & ~3;
         if (pw <= PLANE_W_MAX && (g->pw == 0 || pw * ph < g->pw * g->ph)) { g->pw = pw; g->ph = ph; }
     }
+    // GPU fast's per-row textures get 4-pixel-wide regions instead: each texture is then 32 texels wide, so
+    // a block of pixels finds its 8 input columns in neighbouring tiles. On a Wii, w1 drew 37% faster at 4x64
+    // than at 64x4, and w2 23% faster at 4x24 than at 24x4 (gx_probe.c's region shapes). The output layer is
+    // different: its 116x92 beat every other width tried.
+    if (kind == SCALES_ROW && (((g->npx + 3) / 4 + 3) & ~3) <= EFB_H) {
+        g->pw = 4;
+        g->ph = ((g->npx + 3) / 4 + 3) & ~3;
+    }
     if (g_force_pw) { // probe: a given width instead
         g->pw = g_force_pw;
         g->ph = ((g->npx + g->pw - 1) / g->pw + 3) & ~3;
@@ -947,15 +955,12 @@ int gxm_probe_shape(const LlmModel *m, const LlmMatrix *const *w, const int *row
     }
     out->pw = d->pw;
     out->ph = d->ph;
-    // the same draws three times, each with a different texture counter next to the GPU clock count
-    static const u32 perf1[3] = {GX_PERF1_TEXELS, GX_PERF1_TC_MISS, GX_PERF1_TX_MEMSTALL};
-    u32 *got[3] = {&out->texels, &out->tc_misses, &out->tx_memstall};
-    for (int k = 0; k < 3; k++) {
-        GX_SetGPMetric(GX_PERF0_CLOCKS, perf1[k]);
-        GX_ClearGPMetric();
-        out->draw_ms = gxm_time_draws(d, 16, d->fmt, 0);
-        GX_ReadGPMetric(&out->clocks, got[k]);
-    }
+    // GPU clocks for the draws (on a Wii the texture counters next to it read 0 through libogc)
+    u32 unused;
+    GX_SetGPMetric(GX_PERF0_CLOCKS, GX_PERF1_NONE);
+    GX_ClearGPMetric();
+    out->draw_ms = gxm_time_draws(d, 16, d->fmt, 0);
+    GX_ReadGPMetric(&out->clocks, &unused);
     GX_SetGPMetric(GX_PERF0_NONE, GX_PERF1_NONE);
     gxm_forget_layout();
     run(g, y, x); // once to warm up, then timed

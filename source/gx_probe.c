@@ -381,44 +381,40 @@ static void probe_issue(LlmModel *m, void *w1, const float *x) {
     free(y);
 }
 
-// The same matrices in other pass-region shapes. Every region so far was 4 pixels tall: w2 (24x4) drew at
-// about 63 ns per pixel and pass on a Wii, and stacked w1|w3 (128x4) at 151, 3-4x slower than its pixels
-// and texels explain. Each shape gives the same sums (the hash), so this only asks which layout the GPU
-// and the readback like, and the texture counters say whether the texture cache is why.
+// The same matrices in other pass-region shapes. Each shape gives the same sums (the hash), so this only
+// asks which layout the GPU and the readback like. On a Wii, layer matrices were fastest 4 pixels wide (now
+// GPU fast's layout), and power-of-two widths were slow for the output layer (128x84 took 23 ms, 116x92 4.3).
 static void probe_shapes(LlmModel *m, const float *x) {
     const LlmConfig *c = &m->c;
     LlmLayer *L = &m->layers[0];
     int dim = c->dim, hid = c->hidden_dim, kv = c->dim * c->n_kv_heads / c->n_heads;
-    static const int widths[] = {128, 116, 72, 64, 32, 24, 16, 8, 4};
     struct {
         const char *name;
         const LlmMatrix *w[3];
-        int rows[3], n, cols, blend;
+        int rows[3], n, cols, blend, widths[16];
     } mats[] = {
-        {"w1|w3", {&L->w1, &L->w3}, {hid, hid}, 2, dim, 0},
-        {"w1", {&L->w1}, {hid}, 1, dim, 0},
-        {"q|k|v", {&L->wq, &L->wk, &L->wv}, {dim, kv, kv}, 3, dim, 0},
-        {"w2", {&L->w2}, {dim}, 1, hid, 0},
-        {"cls", {&m->cls}, {c->vocab_size}, 1, dim, 1},
+        {"w1", {&L->w1}, {hid}, 1, dim, 0, {64, 8, 4}},
+        {"wq", {&L->wq}, {dim}, 1, dim, 0, {24, 4}},
+        {"w2", {&L->w2}, {dim}, 1, hid, 0, {24, 4}},
+        {"w1|w3", {&L->w1, &L->w3}, {hid, hid}, 2, dim, 0, {4}},
+        {"q|k|v", {&L->wq, &L->wk, &L->wv}, {dim, kv, kv}, 3, dim, 0, {4}},
+        {"cls", {&m->cls}, {c->vocab_size}, 1, dim, 1, {124, 120, 116, 112, 108, 100, 92, 84, 76, 60, 44, 36, 28}},
     };
     gxm_set_mode(GXM_CLAMP8, 0.5f);
     for (size_t i = 0; i < sizeof(mats) / sizeof(mats[0]); i++) {
         int rows = 0;
         for (int k = 0; k < mats[i].n; k++) rows += mats[i].rows[k];
         int npx = (rows + 2) / 3;
-        for (size_t j = 0; j < sizeof(widths) / sizeof(widths[0]); j++) {
-            int pw = widths[j], ph = ((npx + pw - 1) / pw + 3) & ~3;
-            if (ph > 480 || pw * ph > npx * 5 / 4 + 16) continue; // too tall, or mostly padding
-            if (mats[i].blend && pw < 32) continue;                // 6 MB each; the narrow ones say enough
+        for (int j = 0; j < 16 && mats[i].widths[j]; j++) {
+            int pw = mats[i].widths[j], ph = ((npx + pw - 1) / pw + 3) & ~3;
+            if (ph > 480) continue;
             GxmShape r;
             if (gxm_probe_shape(m, mats[i].w, mats[i].rows, mats[i].n, mats[i].cols, pw, mats[i].blend, x, &r)) {
                 g_log("shape %-5s %3dx%-3d: upload failed\n", mats[i].name, pw, ph);
                 continue;
             }
-            g_log("shape %-5s %3dx%-3d: draws %6.3f ms, matmul %6.3f ms | %lu texels, %lu tex misses, %lu stalled "
-                  "of %lu clocks | %08lx\n", mats[i].name, r.pw, r.ph, r.draw_ms, r.matmul_ms, (unsigned long)r.texels,
-                  (unsigned long)r.tc_misses, (unsigned long)r.tx_memstall, (unsigned long)r.clocks,
-                  (unsigned long)r.hash);
+            g_log("shape %-5s %3dx%-3d: draws %6.3f ms (%lu GPU clocks), matmul %6.3f ms | %08lx\n", mats[i].name,
+                  r.pw, r.ph, r.draw_ms, (unsigned long)r.clocks, r.matmul_ms, (unsigned long)r.hash);
         }
     }
 }

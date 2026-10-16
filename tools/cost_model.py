@@ -117,9 +117,14 @@ def ceil_div(a, b):
     return -(-a // b)
 
 
-def region(rows):
-    """gx_matmul.c's pass region: smallest pw x ph (multiples of 4, pw <= 128) holding ceil(rows/3) pixels."""
+def region(rows, narrow=False):
+    """
+    gx_matmul.c's pass region: smallest pw x ph (multiples of 4, pw <= 128) holding ceil(rows/3) pixels, or
+    for GPU fast's per-row textures (narrow), 4 pixels wide when that fits the framebuffer's 480 lines.
+    """
     npx = ceil_div(rows, 3)
+    if narrow and ceil_div(ceil_div(npx, 4), 4) * 4 <= 480:
+        return 4, ceil_div(ceil_div(npx, 4), 4) * 4
     best = None
     for ph in range(4, 481, 4):
         pw = ceil_div(ceil_div(npx, ph), 4) * 4

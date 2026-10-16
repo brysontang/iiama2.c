@@ -89,7 +89,7 @@ def matmul_efb(w, x, mode):
     q = requantize_rows(w, 32)[0] if mode == "c8" else quantize_q8(w, 32)[0]
     wu = np.full((-(-rows // 3) * 3, cols), 128, np.int32)
     wu[:rows] = q.reshape(rows, cols).astype(np.int32) + 128
-    pw, ph = region(rows)
+    pw, ph = region(rows, narrow=mode == "c8")
     npx = -(-rows // 3)
     img = np.full((ph * pw, 3, cols), 128, np.int32)
     img[:npx] = wu.reshape(npx, 3, cols)
@@ -102,7 +102,8 @@ def matmul_efb(w, x, mode):
     bias = np.where(xs < 0, BIAS_ADDHALF, BIAS_SUBHALF)
     draws = 1 if mode == "c8" else 2
     if mode == "c8":
-        todo, slots_x = list(range((passes - 1) // CHUNK * CHUNK, passes)), 1
+        chunk = min(CHUNK, 480 // ph)
+        todo, slots_x = list(range((passes - 1) // chunk * chunk, passes)), 1
         used = len(todo)
     else:
         slots_x = 640 // pw
