@@ -395,7 +395,7 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         free(x);
     }
     int ps_total, ps_bad = llm_check_paired_singles(m, &ps_total);
-    if (ps_total) report("paired singles: %d of %d int8 matmul outputs differ from the scalar loop\n", ps_bad, ps_total);
+    if (ps_total) report("paired singles: %d of %d int8 matmul and attention outputs differ from the scalar loops\n", ps_bad, ps_total);
 
     LlmSampler s;
     for (int e = 0; e < N_ENGINES; e++) {

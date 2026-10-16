@@ -379,6 +379,74 @@ static inline void q8_group2(const int8_t *r0, const int8_t *r1, const float *xx
                      : [zero] "b"(zero), [quads] "r"(quads), [acc] "b"(acc)
                      : "ctr", "memory");
 }
+
+// Four attention scores at once, for positions t..t+3 of an int8 key cache: each lane still adds
+// q[i] * k[i] for i = 0, 1, 2... in order, the scalar loop's fmadds one for one. psq_l loads two keys of
+// one position (GQR7 = s8), and merges pair up the positions. Raw dot products go to out[0..3].
+static inline void qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out) {
+    static const float zero[2] __attribute__((aligned(8))) = {0.0f, 0.0f};
+    double s01, s23, qq, k0, k1, k2, k3, m0, m1, m2, m3;
+    int o1 = kv_dim, o2 = 2 * kv_dim, o3 = 3 * kv_dim;
+    __asm__ volatile("psq_l %[s01], 0(%[zero]), 0, 0\n\t"
+                     "ps_mr %[s23], %[s01]\n\t"
+                     "mtctr %[pairs]\n"
+                     "1:\n\t"
+                     "psq_l %[qq], 0(%[q]), 0, 0\n\t"
+                     "psq_l %[k0], 0(%[k]), 0, 7\n\t"
+                     "psq_lx %[k1], %[k], %[o1], 0, 7\n\t"
+                     "psq_lx %[k2], %[k], %[o2], 0, 7\n\t"
+                     "psq_lx %[k3], %[k], %[o3], 0, 7\n\t"
+                     "addi %[q], %[q], 8\n\t"
+                     "addi %[k], %[k], 2\n\t"
+                     "ps_merge00 %[m0], %[k0], %[k1]\n\t"
+                     "ps_merge00 %[m2], %[k2], %[k3]\n\t"
+                     "ps_merge11 %[m1], %[k0], %[k1]\n\t"
+                     "ps_merge11 %[m3], %[k2], %[k3]\n\t"
+                     "ps_madds0 %[s01], %[m0], %[qq], %[s01]\n\t"
+                     "ps_madds0 %[s23], %[m2], %[qq], %[s23]\n\t"
+                     "ps_madds1 %[s01], %[m1], %[qq], %[s01]\n\t"
+                     "ps_madds1 %[s23], %[m3], %[qq], %[s23]\n\t"
+                     "bdnz 1b\n\t"
+                     "psq_st %[s01], 0(%[out]), 0, 0\n\t"
+                     "psq_st %[s23], 8(%[out]), 0, 0\n\t"
+                     : [s01] "=&f"(s01), [s23] "=&f"(s23), [qq] "=&f"(qq), [k0] "=&f"(k0), [k1] "=&f"(k1),
+                       [k2] "=&f"(k2), [k3] "=&f"(k3), [m0] "=&f"(m0), [m1] "=&f"(m1), [m2] "=&f"(m2),
+                       [m3] "=&f"(m3), [q] "+b"(q), [k] "+b"(k)
+                     : [zero] "b"(zero), [pairs] "r"(pairs), [o1] "r"(o1), [o2] "r"(o2), [o3] "r"(o3),
+                       [out] "b"(out)
+                     : "ctr", "memory");
+}
+
+// xb[i] += a * v[i] for i < 8 * octets, eight at a time in four pairs: the scalar loop's fmadds lane
+// for lane (GQR7 = s8).
+static inline void axpy_s8(float *xb, const int8_t *v, float a, int octets) {
+    double x0, x1, x2, x3, v0, v1, v2, v3;
+    __asm__ volatile("mtctr %[octets]\n"
+                     "1:\n\t"
+                     "psq_l %[x0], 0(%[xb]), 0, 0\n\t"
+                     "psq_l %[x1], 8(%[xb]), 0, 0\n\t"
+                     "psq_l %[x2], 16(%[xb]), 0, 0\n\t"
+                     "psq_l %[x3], 24(%[xb]), 0, 0\n\t"
+                     "psq_l %[v0], 0(%[v]), 0, 7\n\t"
+                     "psq_l %[v1], 2(%[v]), 0, 7\n\t"
+                     "psq_l %[v2], 4(%[v]), 0, 7\n\t"
+                     "psq_l %[v3], 6(%[v]), 0, 7\n\t"
+                     "ps_madds0 %[x0], %[v0], %[a], %[x0]\n\t"
+                     "ps_madds0 %[x1], %[v1], %[a], %[x1]\n\t"
+                     "ps_madds0 %[x2], %[v2], %[a], %[x2]\n\t"
+                     "ps_madds0 %[x3], %[v3], %[a], %[x3]\n\t"
+                     "psq_st %[x0], 0(%[xb]), 0, 0\n\t"
+                     "psq_st %[x1], 8(%[xb]), 0, 0\n\t"
+                     "psq_st %[x2], 16(%[xb]), 0, 0\n\t"
+                     "psq_st %[x3], 24(%[xb]), 0, 0\n\t"
+                     "addi %[xb], %[xb], 32\n\t"
+                     "addi %[v], %[v], 8\n\t"
+                     "bdnz 1b\n\t"
+                     : [x0] "=&f"(x0), [x1] "=&f"(x1), [x2] "=&f"(x2), [x3] "=&f"(x3), [v0] "=&f"(v0),
+                       [v1] "=&f"(v1), [v2] "=&f"(v2), [v3] "=&f"(v3), [xb] "+b"(xb), [v] "+b"(v)
+                     : [a] "f"(a), [octets] "r"(octets)
+                     : "ctr", "memory");
+}
 #endif
 
 static void matmul_q8(float *xout, const float *x, const int8_t *w, const float *s, int n, int d, int gs) {
@@ -430,6 +498,32 @@ int llm_check_paired_singles(const LlmModel *m, int *total) {
         matmul_q8_scalar(b, x, mats[k]->q, mats[k]->s, cols[k], rows, m->gs);
         for (int i = 0; i < rows; i++) bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
         *total += rows;
+    }
+    // attention: layer 0's wk bytes stand in for an int8 key/value cache of 8 positions
+    int hs = c->dim / c->n_heads, kv_dim = c->dim * c->n_kv_heads / c->n_heads;
+    if (hs % 8 == 0 && hs <= 257) { // wk has kv_dim rows of dim >= 8 bytes, and a holds hs floats
+        __asm__ volatile("mtspr 919, %0" : : "r"(GQR_S8));
+        const int8_t *kc = m->layers[0].wk.q;
+        float s4[4] __attribute__((aligned(8)));
+        for (int t = 0; t < 8; t += 4) { // q.k, four positions at a time
+            qk4_s8(x, kc + (size_t)t * kv_dim, kv_dim, hs / 2, s4);
+            for (int j = 0; j < 4; j++) {
+                const int8_t *kk = kc + (size_t)(t + j) * kv_dim;
+                float score = 0.0f;
+                for (int i = 0; i < hs; i++) score += x[i] * I8F(kk[i]);
+                bad += memcmp(&s4[j], &score, sizeof(float)) != 0;
+                (*total)++;
+            }
+        }
+        for (int i = 0; i < hs; i++) a[i] = b[i] = x[n - 1 - i]; // att*v over 8 positions
+        for (int t = 0; t < 8; t++) {
+            const int8_t *vv = kc + (size_t)t * kv_dim;
+            float w = 0.71f - t * 0.13f;
+            axpy_s8(a, vv, w, hs / 8);
+            for (int i = 0; i < hs; i++) b[i] += w * I8F(vv[i]);
+        }
+        for (int i = 0; i < hs; i++) bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        *total += hs;
     }
     free(x);
     free(a);
@@ -537,6 +631,11 @@ float *llm_forward(LlmModel *m, int token, int pos) {
     prof_lap(pf, LLM_PROF_ROPE_TABLE);
 
     int kv8 = m->key_cache8 != NULL;
+#ifdef GEKKO
+    // paired-single attention: int8 KV, whole octets per head, and 8-byte aligned q and xb for psq_l
+    int ps_attn = kv8 && head_size % 8 == 0 && ((uintptr_t)m->q & 7) == 0 && ((uintptr_t)m->xb & 7) == 0;
+    if (ps_attn) __asm__ volatile("mtspr 919, %0" : : "r"(GQR_S8)); // GQR7: load s8, unscaled
+#endif
     for (int l = 0; l < p->n_layers; l++) {
         LlmLayer *w = &m->layers[l];
 
@@ -589,7 +688,20 @@ float *llm_forward(LlmModel *m, int token, int pos) {
             int kh = h / kv_mul;
             float *q = m->q + h * head_size;
             float *att = m->att + h * p->seq_len;
-            for (int t = 0; t <= pos; t++) {
+            int t = 0;
+#ifdef GEKKO
+            if (ps_attn) {
+                float s4[4] __attribute__((aligned(8)));
+                for (; t + 4 <= pos + 1; t += 4) {
+                    qk4_s8(q, m->key_cache8 + loff + (size_t)t * kv_dim + kh * head_size, kv_dim, head_size / 2, s4);
+                    for (int j = 0; j < 4; j++) { // the scalar loop's scale and divide, per score
+                        float score = s4[j] * m->key_scale[soff + (size_t)(t + j) * p->n_kv_heads + kh];
+                        att[t + j] = score / sqrt_hs;
+                    }
+                }
+            }
+#endif
+            for (; t <= pos; t++) {
                 size_t at = loff + (size_t)t * kv_dim + kh * head_size;
                 float score = 0.0f;
                 if (kv8) {
@@ -614,6 +726,12 @@ float *llm_forward(LlmModel *m, int token, int pos) {
                 if (kv8) {
                     const int8_t *vv = m->value_cache8 + at;
                     a *= m->value_scale[soff + (size_t)t * p->n_kv_heads + kh];
+#ifdef GEKKO
+                    if (ps_attn) {
+                        axpy_s8(xb, vv, a, head_size / 8);
+                        continue;
+                    }
+#endif
                     for (int i = 0; i < head_size; i++) xb[i] += a * I8F(vv[i]);
                 } else {
                     const float *vv = m->value_cache + at;
