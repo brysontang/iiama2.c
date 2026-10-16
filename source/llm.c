@@ -598,7 +598,7 @@ static void rmsnorm(float *o, const float *x, const float *weight, int size) {
 // tools/tev_sim/llama.py (fast_exp), which copies it operation for operation. newlib's expf costs about
 // 150 cycles a call on the Wii. Cody-Waite reduction x = n ln2 + r, |r| <= ln2/2, then Cephes expf's
 // polynomial for e^r (about 1 ulp), times 2^n built from its exponent bits.
-NO_FMA static float exp_f(float x) {
+NO_FMA static inline float exp_f(float x) {
     NO_FMA_BODY
     if (x < -87.0f) return 0.0f; // e^-87 is just above FLT_MIN, so no denormals below
     if (x > 88.0f) return INFINITY;
@@ -631,7 +631,8 @@ uint32_t llm_check_exp(void) {
 #define EXPF exp_f
 #endif
 
-static void softmax(float *x, int size) {
+NO_FMA static void softmax(float *x, int size) { // no multiply-adds to fuse here: NO_FMA lets exp_f inline
+    NO_FMA_BODY
     float max_val = x[0];
     for (int i = 1; i < size; i++)
         if (x[i] > max_val) max_val = x[i];
@@ -641,6 +642,17 @@ static void softmax(float *x, int size) {
         sum += x[i];
     }
     for (int i = 0; i < size; i++) x[i] /= sum;
+}
+
+// hb = silu(hb) * hb2, in a function of its own so exp_f can inline (no multiply-adds here to fuse either)
+NO_FMA static void silu_mul(float *hb, const float *hb2, int n) {
+    NO_FMA_BODY
+    for (int i = 0; i < n; i++) {
+        float val = hb[i];
+        val *= (1.0f / (1.0f + EXPF(-val)));
+        val *= hb2[i];
+        hb[i] = val;
+    }
 }
 
 float *llm_forward(LlmModel *m, int token, int pos) {
@@ -803,12 +815,7 @@ float *llm_forward(LlmModel *m, int token, int pos) {
             matmul(m, m->hb2, m->xb, &w->w3, dim, hidden_dim);
         }
         prof_lap(pf, LLM_PROF_W1W3);
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = m->hb[i];
-            val *= (1.0f / (1.0f + EXPF(-val)));
-            val *= m->hb2[i];
-            m->hb[i] = val;
-        }
+        silu_mul(m->hb, m->hb2, hidden_dim);
         prof_lap(pf, LLM_PROF_SILU);
         matmul(m, m->xb, m->hb, &w->w2, hidden_dim, dim);
         prof_lap(pf, LLM_PROF_W2);
@@ -1007,6 +1014,7 @@ static int sample_argmax(const float *p, int n) {
     return max_i;
 }
 
+#ifdef LLM_EXACT_MATMUL // llama2.c's sampler, for comparing with upstream
 static int sample_mult(const float *p, int n, float coin) {
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -1016,12 +1024,66 @@ static int sample_mult(const float *p, int n, float coin) {
     return n - 1;
 }
 
+#endif
+
 static int compare_prob(const void *a, const void *b) {
     const LlmProbIndex *a_ = (const LlmProbIndex *)a, *b_ = (const LlmProbIndex *)b;
     if (a_->prob > b_->prob) return -1;
     if (a_->prob < b_->prob) return 1;
     return 0;
 }
+
+#ifndef LLM_EXACT_MATMUL
+// llama2.c's sampling (top-p with its cutoff, then multinomial) on unnormalized weights e^((l - max) / T):
+// one multiply per logit instead of two divides, and exp only within 24 of the top logit (a quarter of
+// stories15M's vocab at T 0.8; all the rest together never passed 5.4e-7 of the probability, measured over
+// 300 positions, which is below the rounding of the sum).
+NO_FMA static int sample_weights(LlmSampler *s, float *w) {
+    NO_FMA_BODY
+    int n = s->vocab_size;
+    float max_val = w[0];
+    for (int i = 1; i < n; i++)
+        if (w[i] > max_val) max_val = w[i];
+    float inv_t = 1.0f / s->temperature, sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = (w[i] - max_val) * inv_t;
+        w[i] = d > -24.0f ? exp_f(d) : 0.0f;
+        sum += w[i];
+    }
+    float coin = random_f32(&s->rng_state);
+    if (s->topp <= 0 || s->topp >= 1) {
+        float r = coin * sum, cdf = 0.0f;
+        for (int i = 0; i < n; i++) {
+            cdf += w[i];
+            if (r < cdf) return i;
+        }
+        return n - 1;
+    }
+    const float cutoff = (1.0f - s->topp) / (n - 1) * sum;
+    LlmProbIndex *pi = s->probindex;
+    int n0 = 0;
+    for (int i = 0; i < n; i++) {
+        if (w[i] >= cutoff) {
+            pi[n0].index = i;
+            pi[n0].prob = w[i];
+            n0++;
+        }
+    }
+    qsort(pi, n0, sizeof(LlmProbIndex), compare_prob); // ~100 tokens, not the vocab
+    float target = s->topp * sum, cumulative = 0.0f;
+    int last = n0 - 1;
+    for (int i = 0; i < n0; i++) {
+        cumulative += pi[i].prob;
+        if (cumulative > target) { last = i; break; }
+    }
+    float r = coin * cumulative, cdf = 0.0f;
+    for (int i = 0; i <= last; i++) {
+        cdf += pi[i].prob;
+        if (r < cdf) return pi[i].index;
+    }
+    return pi[last].index;
+}
+#else
 
 static int sample_topp(const float *p, int n, float topp, LlmProbIndex *pi, float coin) {
     int n0 = 0;
@@ -1048,14 +1110,19 @@ static int sample_topp(const float *p, int n, float topp, LlmProbIndex *pi, floa
     }
     return pi[last_idx].index;
 }
+#endif
 
 int llm_sample(LlmSampler *s, float *logits) {
     if (s->temperature == 0.0f) return sample_argmax(logits, s->vocab_size);
+#ifndef LLM_EXACT_MATMUL
+    return sample_weights(s, logits);
+#else
     for (int q = 0; q < s->vocab_size; q++) logits[q] /= s->temperature;
     softmax(logits, s->vocab_size);
     float coin = random_f32(&s->rng_state);
     if (s->topp <= 0 || s->topp >= 1) return sample_mult(logits, s->vocab_size, coin);
     return sample_topp(logits, s->vocab_size, s->topp, s->probindex, coin);
+#endif
 }
 
 // ----------------------------------------------------------------------------
