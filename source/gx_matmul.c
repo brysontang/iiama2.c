@@ -57,6 +57,7 @@ typedef struct GxMat {
     GXTexObj *obj;
     float *st;          // SCALES_GROUP: weight scales transposed to (cols / gs, 3 * npx) so the readback streams them
     int kind;           // SCALES_*
+    int fmt;            // texel format: GX_TF_RGBA8, or GX_TF_RGB565 for the blended output layer
     float *srow;        // SCALES_ROW and SCALES_BLEND: per-row scales (3 * npx, zero past the last row)
     struct GxMat *per_row; // a layer matrix's SCALES_ROW twin, which clamp8 runs on
 } GxMat;
@@ -191,6 +192,19 @@ static void load_layout(int mode) {
     g_layout = mode;
 }
 
+// RGB565 for the blended output layer: half the bytes of RGBA8, and fetching textures is what limits the
+// GPU there. A texture byte b becomes the 5- or 6-bit code whose expansion ((c << 3) | (c >> 2), or
+// (c << 2) | (c >> 4)) is nearest, the lower one on a tie. Must match snap() in gxmatmul.py.
+static uint8_t rgb565_code(int b, int bits) {
+    int best = 0, best_d = 256;
+    for (int c = 0; c < 1 << bits; c++) {
+        int e = bits == 5 ? (c << 3) | (c >> 2) : (c << 2) | (c >> 4);
+        int d = e > b ? e - b : b - e;
+        if (d < best_d) best = c, best_d = d;
+    }
+    return (uint8_t)best;
+}
+
 // Texture byte for (row, col): the CPU's int8 weight + 128, or the weight requantized with one scale
 // per row. Must match requantize_rows in tools/tev_sim/gxmatmul.py exactly.
 static uint8_t wu(const GxMat *g, const LlmMatrix *w, int row, int col) {
@@ -224,7 +238,8 @@ static GxMat *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, 
     }
     g->ntex = cols / PLANES;
     int tw = PLANES * g->pw;
-    g->tex_bytes = (uint32_t)tw * g->ph * 4;
+    g->fmt = kind == SCALES_BLEND ? GX_TF_RGB565 : GX_TF_RGBA8;
+    g->tex_bytes = (uint32_t)tw * g->ph * (g->fmt == GX_TF_RGB565 ? 2 : 4);
     if (g->pw == 0) {
         free(g);
         llm_set_error("matrix too tall for the framebuffer (%d rows)", rows);
@@ -266,7 +281,13 @@ static GxMat *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, 
             for (int k = 0; k < groups; k++) g->st[(size_t)k * padded_rows + r] = w->s[(size_t)r * groups + k];
     }
 
-    // RGBA8 textures are 4x4 tiles of 64 bytes: 16 AR pairs, then 16 GB pairs
+    uint8_t c5[256], c6[256];
+    for (int b = 0; b < 256; b++) {
+        c5[b] = rgb565_code(b, 5);
+        c6[b] = rgb565_code(b, 6);
+    }
+    // RGBA8 textures are 4x4 tiles of 64 bytes: 16 AR pairs, then 16 GB pairs.
+    // RGB565 textures are 4x4 tiles of 32 bytes: 16 big-endian RRRRRGGG GGGBBBBB texels.
     for (int t = 0; t < g->ntex; t++) {
         uint8_t *base = g->tex + (size_t)t * g->tex_bytes;
         for (int j = 0; j < PLANES; j++) {
@@ -274,17 +295,23 @@ static GxMat *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, 
             for (int py = 0; py < g->ph; py++) {
                 for (int px = 0; px < g->pw; px++) {
                     int tx = j * g->pw + px, row = 3 * (py * g->pw + px);
-                    uint8_t *tile = base + ((((py >> 2) * (tw >> 2)) + (tx >> 2)) << 6);
-                    int i = ((py & 3) << 2) | (tx & 3);
+                    int i = ((py & 3) << 2) | (tx & 3), tile_n = ((py >> 2) * (tw >> 2)) + (tx >> 2);
+                    uint8_t r = wu(g, w, row, col), gg = wu(g, w, row + 1, col), b = wu(g, w, row + 2, col);
+                    if (g->fmt == GX_TF_RGB565) {
+                        uint16_t *tile = (uint16_t *)(base + (tile_n << 5));
+                        tile[i] = (uint16_t)(c5[r] << 11 | c6[gg] << 5 | c5[b]);
+                        continue;
+                    }
+                    uint8_t *tile = base + (tile_n << 6);
                     tile[2 * i] = 0;
-                    tile[2 * i + 1] = wu(g, w, row, col);
-                    tile[32 + 2 * i] = wu(g, w, row + 1, col);
-                    tile[32 + 2 * i + 1] = wu(g, w, row + 2, col);
+                    tile[2 * i + 1] = r;
+                    tile[32 + 2 * i] = gg;
+                    tile[32 + 2 * i + 1] = b;
                 }
             }
         }
         DCFlushRange(base, g->tex_bytes);
-        GX_InitTexObj(&g->obj[t], base, tw, g->ph, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+        GX_InitTexObj(&g->obj[t], base, tw, g->ph, g->fmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
         GX_InitTexObjFilterMode(&g->obj[t], GX_NEAR, GX_NEAR);
     }
     GX_InvalidateTexAll();
@@ -820,9 +847,9 @@ float gxm_time_draws(void *gpu, int stages, int fmt, int tiny) {
         int odd = p & 1;
         set_pass(kb, neg, 16, odd, GX_CC_C0, 1);
         GX_SetBlendMode(p == 0 ? GX_BM_NONE : odd ? GX_BM_SUBTRACT : GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
-        if (!tiny && fmt == GX_TF_RGBA8) {
+        if (!tiny && fmt == g->fmt) {
             set_textures(g, 2 * p, 2, p == 0);
-        } else if (!tiny && fmt >= 0) { // the same memory read as a smaller texel format
+        } else if (!tiny && fmt >= 0) { // the same memory read as another texel format no bigger than it
             for (int t = 0; t < 2; t++) {
                 GX_InitTexObj(&obj[t], g->tex + (size_t)(2 * p + t) * g->tex_bytes, tw, g->ph, fmt, GX_CLAMP, GX_CLAMP,
                               GX_FALSE);

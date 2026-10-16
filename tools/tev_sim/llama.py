@@ -86,12 +86,24 @@ def softmax(x):
     return e / e.sum()
 
 
+def quantize_kv(v, hs):
+    """One position's keys or values -> int8 per head, scale amax / 127 (llm.c's quantize_kv)."""
+    v = v.reshape(-1, hs)
+    s = (np.abs(v).max(axis=1) / np.float32(127)).astype(np.float32)
+    q = np.clip(np.rint(v / np.where(s == 0, np.float32(1), s)[:, None]), -127, 127).astype(np.float32)
+    return q.reshape(-1), s
+
+
 class Transformer:
     def __init__(self, W, backend):
         self.W, self.mm = W, backend
         kv_dim = W.dim * W.n_kv_heads // W.n_heads
         self.k_cache = np.zeros((W.n_layers, W.seq_len, kv_dim), np.float32)
         self.v_cache = np.zeros_like(self.k_cache)
+        # int8 models (everything but the fp32 reference) keep an int8 KV cache, one scale per head and position
+        self.kv8 = not isinstance(backend, F32)
+        self.k_scale = np.zeros((W.n_layers, W.seq_len, W.n_kv_heads), np.float32)
+        self.v_scale = np.zeros_like(self.k_scale)
         hs = W.dim // W.n_heads
         freqs = 1.0 / np.power(10000.0, (np.arange(0, W.dim, 2) % hs) / hs)
         self.rope_freqs = freqs.astype(np.float32)
@@ -118,13 +130,22 @@ class Transformer:
             v = mm(("wv", l), xb)
             self.rope(q, pos)
             self.rope(k, pos)
-            self.k_cache[l, pos], self.v_cache[l, pos] = k, v
+            if self.kv8:
+                (self.k_cache[l, pos], self.k_scale[l, pos]), (self.v_cache[l, pos], self.v_scale[l, pos]) = (
+                    quantize_kv(k, hs), quantize_kv(v, hs))
+            else:
+                self.k_cache[l, pos], self.v_cache[l, pos] = k, v
             out = np.empty(dim, np.float32)
             for h in range(W.n_heads):
                 kh = h // kv_mul
                 K = self.k_cache[l, : pos + 1, kh * hs:(kh + 1) * hs]
                 V = self.v_cache[l, : pos + 1, kh * hs:(kh + 1) * hs]
-                att = softmax(K @ q[h * hs:(h + 1) * hs] / np.sqrt(hs))
+                scores = K @ q[h * hs:(h + 1) * hs]
+                if self.kv8:
+                    scores = scores * self.k_scale[l, : pos + 1, kh]
+                att = softmax(scores / np.sqrt(hs))
+                if self.kv8:
+                    att = att * self.v_scale[l, : pos + 1, kh]
                 out[h * hs:(h + 1) * hs] = att @ V
             x = x + mm(("wo", l), out)
             xb = rmsnorm(x, W.rms_ffn[l])

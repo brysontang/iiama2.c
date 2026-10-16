@@ -51,8 +51,13 @@ typedef struct {
     float *rms_att, *rms_ffn, *rms_final;
     LlmMatrix emb, cls;
     LlmLayer *layers;
-    // activations + KV cache
+    // activations + KV cache. int8 models keep the cache in int8 with one scale per head and position
+    // (key_cache8 etc.), a quarter of the bytes for attention to read; fp32 models keep it in float.
     float *x, *xb, *xb2, *hb, *hb2, *q, *att, *logits, *key_cache, *value_cache;
+    int8_t *key_cache8, *value_cache8;
+    float *key_scale, *value_scale; // [layer][position][kv head]
+    float *k, *v;                   // this position's key and value, before they're quantized
+    float *rope;                    // this position's RoPE cos/sin pairs, one per two head dimensions
     size_t bytes; // total bytes allocated, for the stats screen
     // GPU offload (all zero = CPU only)
     int mode;                  // LLM_MODE_*

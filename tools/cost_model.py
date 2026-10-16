@@ -17,20 +17,28 @@ Where the numbers come from:
                 Broadway's single load/store unit -> 3 cycles/MAC, plus about
                 8 cycles of per-group overhead every 32 MACs.
   GPU           measured by the probe (gx_probe.c): the TEV does 951M pixel-
-                stages/s when texture fetch keeps up, and RGBA8 textures stream
-                from MEM2 at 1.9 GB/s, which holds it to half that.
+                stages/s when texture fetch keeps up, but fetching from MEM2
+                holds it to 478M texels/s for RGBA8 and 716M for RGB565.
   issue         measured by the probe: cycles per pass, raw register writes
                 now, libogc's setters before.
   readback      fitted to the bench, all in (instructions and cache misses):
                 per pixel and pass for GPU fast, per row and pass for exact11,
                 per row for the blended output layer.
+  attention     from the compiled loops: q.k waits on one accumulator, att*v
+                is four loads and stores a MAC; int8 keys and values add a table
+                lookup. Quantizing each new key and value divides and calls rintf.
   the rest      fitted to the bench on a real Wii (README, "Speed"): CPU memory
-                bandwidth, copy rate, sync cost, and ~2.6 us of GPU time per
-                draw in GPU fast's pipeline that the probes don't explain yet.
+                bandwidth, copy rate, sync cost, ~2.6 us of GPU time per draw in
+                GPU fast's pipeline that the probes don't explain yet, and how
+                fast the KV cache reads (mostly from L2 at the bench's positions).
 
 The first fit (--before) predicted the blended classifier's speedups within 4%
 of what the Wii then measured. The next round's prediction missed GPU fast by
-17% (51 vs 43.5 tok/s), mostly on the readback's cache misses.
+17% (51 vs 43.5 tok/s), mostly on the readback's cache misses. The one after
+missed by 3% (51 vs 49.4): it read the float KV cache at main-memory speed,
+when at positions 0-63 it mostly sits in L2, so shrinking it to int8 saved less
+than predicted. How the KV cache costs further into a story is a guess until a
+long run measures it.
 
 Useful for asking what a change would buy before writing it. Stdlib only.
 """
@@ -42,10 +50,11 @@ CPU_HZ, GPU_HZ = 729e6, 243e6
 PARAMS = {
     "cpu_bw": 250e6,     # effective CPU streaming read bandwidth, as the int8 matmul sees it (MEM1)
     "tev_rate": 951e6,   # TEV pixel-stages per second when texture fetch keeps up (4 pixels a clock)
-    "gpu_bw": 1.9e9,     # RGBA8 texture fetch from MEM2; it holds the TEV to half its rate
+    "tex_rate": {"RGBA8": 478e6, "RGB565": 716e6},  # texels per second fetched from MEM2 (probe)
     "copy_rate": 972e6,  # framebuffer-to-RAM copy, pixels per second
     "sync_s": 40e-6,     # one GX_DrawDone round trip
     "draw_s": 2.6e-6,    # GPU time per small pipelined draw beyond its pixels (fitted to GPU fast; unexplained)
+    "kv_bw": 0.84e9,     # KV cache reads, fitted: at the bench's positions it's mostly in L2
     "ipc": 1.0,          # instructions per cycle for branchy glue code (norms, RoPE, GX calls)
 }
 
@@ -53,13 +62,14 @@ PARAMS = {
 # engines as first run, and now.
 MEASURED_BEFORE = {"CPU": 7.41, "split (GPU classifier + CPU top-64)": 12.29, "GPU, fast (clamp8)": 20.55,
                    "GPU, exact (exact11)": 9.46, "GPU, exact + CPU top-64": 9.41}
-MEASURED = {"CPU": 7.41, "split (GPU classifier + CPU top-256)": 15.38, "GPU, fast (clamp8)": 43.51,
-            "GPU, exact (exact11)": 20.62}
+MEASURED = {"CPU": 7.44, "split (GPU classifier + CPU top-256)": 16.06, "GPU, fast (clamp8)": 49.41,
+            "GPU, exact (exact11)": 21.91}
 
 RESCORE_K = 256      # classifier candidates the CPU recomputes exactly (LlmModel.rescore_k)
 
 INT8_CYC_PER_MAC = 3.0 + 8 / 32
-ATTN_CYC_PER_MAC = 3.5   # q.k has one dependent accumulator; att*v is load/load/store
+ATTN_CYC_PER_MAC = {"f32": 3.5, "int8": 3.75}  # q.k waits on its accumulator; att*v is load/load/store (+ lookup)
+QUANT_KV_CYC = 45        # per key or value element: a divide and a call to rintf
 # Readback, all in, fitted to the Wii. Now: framebuffer copies in MEM1, per-group scales in MEM2.
 ROWS_CYC_PER_PIXEL_PASS = 21.0  # GPU fast (sum_pixel): per pixel (3 rows) and pass; ~5 of it instructions
 EXACT_CYC_PER_ROW_PASS = 24.8   # exact11: two bytes, two table lookups and a scale per row and pass
@@ -70,7 +80,8 @@ ISSUE_CYC = {"clamp8": 1270, "exact11": 940}  # per pass, raw register writes (p
 READBACK_CYC = 13.0      # per row and pass, clamp8, plus the copy and scales at cpu_bw
 READBACK_EXACT = 1.4     # exact11 relative to clamp8
 ISSUE_CYC_LIBOGC = {"clamp8": 3600, "exact11": 2100}
-OTHER_INSTR = 2.5e6      # norms, RoPE trig, SiLU, residuals, embedding, greedy argmax
+OTHER_INSTR = 3.1e6      # norms, SiLU, residuals, embedding, greedy argmax
+ROPE_INSTR = {"per layer": 0.35e6, "per token": 0.01e6}  # powf/cosf/sinf, before and after hoisting them
 SAMPLING_INSTR = 5e6     # softmax over the vocab + top-p sort, when temperature > 0
 
 
@@ -138,7 +149,8 @@ def rows_matmul_s(mats, p):
         chunks = []
         for p0 in range(0, passes, ROWS_CHUNK):
             k = min(ROWS_CHUNK, passes - p0)
-            gpu = max(k * px * 16 / p["tev_rate"], k * px * 64 / p["gpu_bw"]) + k * px / p["copy_rate"] + k * p["draw_s"]
+            texels = k * px * 16
+            gpu = max(texels / p["tev_rate"], texels / p["tex_rate"]["RGBA8"]) + k * px / p["copy_rate"] + k * p["draw_s"]
             total_sum = ceil_div(rows, 3) * k * ROWS_CYC_PER_PIXEL_PASS / CPU_HZ
             chunks.append((k * ISSUE_CYC["clamp8"] / CPU_HZ, gpu, total_sum))
         total = pipeline_s(chunks)
@@ -159,9 +171,10 @@ def gpu_matmul_s(mats, mode, p, before=False):
         batches = ceil_div(passes, per_batch)
         px = pw * ph
         pixel_stages = passes * px * sum(stages)
-        tex_bytes = passes * px * cols_per_pass * 4  # one RGBA8 texel per product stage
+        texels = passes * px * cols_per_pass  # one texel per product stage
+        fmt = "RGB565" if mode == "blend" and not before else "RGBA8"
         issue = passes * (ISSUE_CYC_LIBOGC if before else ISSUE_CYC)["exact11" if mode == "exact11" else "clamp8"] / CPU_HZ
-        gpu = max(pixel_stages / p["tev_rate"], tex_bytes / p["gpu_bw"])
+        gpu = max(pixel_stages / p["tev_rate"], texels / p["tex_rate"][fmt])
         t["issue"] += issue
         t["gpu"] += max(gpu - issue, 0.0)  # the GPU works through the FIFO while the CPU is still issuing
         if mode == "blend":  # every pass blends into one region: one copy, one byte and one scale per row
@@ -178,10 +191,14 @@ def gpu_matmul_s(mats, mode, p, before=False):
     return sum(t.values()), t
 
 
-def attention_s(c, pos, p):
+def attention_s(c, pos, p, kv="int8"):
+    """Attention over positions 0..pos, KV cache as int8 (a scale per head vector) or f32, plus caching this token."""
     macs = c["layers"] * 2 * c["dim"] * (pos + 1)
-    kv_bytes = c["layers"] * 2 * (pos + 1) * (c["dim"] * c["kv_heads"] // c["heads"]) * 4
-    return macs * ATTN_CYC_PER_MAC / CPU_HZ + kv_bytes / p["cpu_bw"]
+    kv_dim = c["dim"] * c["kv_heads"] // c["heads"]
+    vectors = c["layers"] * 2 * (pos + 1)
+    kv_bytes = vectors * (kv_dim + 4 * c["kv_heads"]) if kv == "int8" else vectors * kv_dim * 4
+    quantize = c["layers"] * 2 * kv_dim * QUANT_KV_CYC if kv == "int8" else 0
+    return (macs * ATTN_CYC_PER_MAC[kv] + quantize) / CPU_HZ + kv_bytes / p["kv_bw"]
 
 
 def rescore_s(c, k, p):
@@ -192,7 +209,8 @@ def rescore_s(c, k, p):
 def engine_s(c, engine, p, pos, sampling, before=False):
     """before: the engines as first measured, with the classifier as 18 clamp8 passes per row."""
     layers, cls = matrices(c)
-    base = attention_s(c, pos, p) + (OTHER_INSTR + (SAMPLING_INSTR if sampling else 0)) / (p["ipc"] * CPU_HZ)
+    other = OTHER_INSTR + ROPE_INSTR["per layer" if before else "per token"] + (SAMPLING_INSTR if sampling else 0)
+    base = attention_s(c, pos, p, "f32" if before else "int8") + other / (p["ipc"] * CPU_HZ)
     parts = {"attention+other": base}
     if engine == "CPU":
         parts["CPU matmuls"] = cpu_matmul_s(layers + cls, p)

@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from cost_model import region
 from export_wii import quantize_q8
-from gxmatmul import BlendMatrix, TevMatrix, quantize_x, requantize_rows
+from gxmatmul import E5, E6, BlendMatrix, TevMatrix, quantize_x, requantize_rows
 from llama import Weights
 from tev import (
     BIAS_ADDHALF,
@@ -137,6 +137,13 @@ def expected_tex():
     return e
 
 
+def expected_rgb565():
+    """probe_rgb565: texel x holds r = x & 31, g = x, b = 31 - (x & 31), widened the way gxmatmul.py assumes."""
+    x = np.arange(64)
+    row = np.stack([E5[x & 31], E6[x], E5[31 - (x & 31)]], -1)
+    return np.broadcast_to(row, (4, 64, 3)).astype(np.int32)
+
+
 def expected_konst():
     e = np.zeros((32, 64, 3), np.int32)
     for r in range(8):
@@ -219,7 +226,7 @@ def main():
     args = ap.parse_args()
 
     got = read_probe(args.probe_bin)
-    simple = {"tex": expected_tex, "konst": expected_konst, "reg": expected_reg, "arith": expected_arith,
+    simple = {"tex": expected_tex, "rgb565": expected_rgb565, "konst": expected_konst, "reg": expected_reg, "arith": expected_arith,
               "div": expected_div, "blend": expected_blend}
     for name, fn in simple.items():
         if name in got:

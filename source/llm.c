@@ -133,6 +133,8 @@ void llm_free_model(LlmModel *m) {
     free(m->rms_att); free(m->rms_ffn); free(m->rms_final);
     free(m->x); free(m->xb); free(m->xb2); free(m->hb); free(m->hb2); free(m->q);
     free(m->att); free(m->logits); free(m->key_cache); free(m->value_cache);
+    free(m->key_cache8); free(m->value_cache8); free(m->key_scale); free(m->value_scale);
+    free(m->k); free(m->v); free(m->rope);
     memset(m, 0, sizeof(*m));
 }
 
@@ -185,8 +187,20 @@ int llm_load_model(LlmModel *m, const char *path, LlmProgressFn progress, void *
     ALLOC(m->q, dim, "activations");
     ALLOC(m->att, (size_t)c->n_heads * c->seq_len, "attention buffer");
     ALLOC(m->logits, c->vocab_size, "logits");
-    ALLOC(m->key_cache, L * c->seq_len * kv_dim, "KV cache");
-    ALLOC(m->value_cache, L * c->seq_len * kv_dim, "KV cache");
+    if (m->dtype == LLM_DTYPE_Q8) {
+        size_t n = L * c->seq_len * kv_dim;
+        if (!(m->key_cache8 = (int8_t *)track_alloc(m, n, "KV cache")) ||
+            !(m->value_cache8 = (int8_t *)track_alloc(m, n, "KV cache")))
+            goto done;
+        ALLOC(m->key_scale, L * c->seq_len * c->n_kv_heads, "KV cache");
+        ALLOC(m->value_scale, L * c->seq_len * c->n_kv_heads, "KV cache");
+        ALLOC(m->k, kv_dim, "activations");
+        ALLOC(m->v, kv_dim, "activations");
+    } else {
+        ALLOC(m->key_cache, L * c->seq_len * kv_dim, "KV cache");
+        ALLOC(m->value_cache, L * c->seq_len * kv_dim, "KV cache");
+    }
+    ALLOC(m->rope, dim / c->n_heads, "activations");
     ALLOC(m->rms_att, L * dim, "norm weights");
     ALLOC(m->rms_ffn, L * dim, "norm weights");
     ALLOC(m->rms_final, dim, "norm weights");
@@ -244,6 +258,19 @@ static void init_lut(void) {
 }
 
 #define I8F(v) g_i8_to_f32[(uint8_t)(v)]
+
+// One head's key or value vector -> int8, scale amax / 127. Must match quantize_kv in tools/tev_sim/llama.py.
+static void quantize_kv(const float *x, int n, int8_t *q, float *scale) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++)
+        if (fabsf(x[i]) > amax) amax = fabsf(x[i]);
+    float s = amax / 127.0f, d = s == 0.0f ? 1.0f : s;
+    *scale = s;
+    for (int i = 0; i < n; i++) {
+        float r = rintf(x[i] / d);
+        q[i] = (int8_t)(r > 127.0f ? 127 : r < -127.0f ? -127 : r);
+    }
+}
 
 static void matmul_f32(float *xout, const float *x, const float *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
@@ -374,14 +401,25 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         for (int j = 0; j < dim; j++) x[j] = I8F(row[j]) * rs[j / m->gs];
     }
 
+    // RoPE's rotations depend only on the position and the dimension within a head, so they're computed
+    // once per token instead of once per layer and head (the same operations, so the same floats)
+    for (int i = 0; i < head_size; i += 2) {
+        float freq = 1.0f / powf(10000.0f, i / (float)head_size);
+        float val = pos * freq;
+        m->rope[i] = cosf(val);
+        m->rope[i + 1] = sinf(val);
+    }
+
+    int kv8 = m->key_cache8 != NULL;
     for (int l = 0; l < p->n_layers; l++) {
         LlmLayer *w = &m->layers[l];
 
         rmsnorm(m->xb, x, m->rms_att + (size_t)l * dim, dim);
 
         size_t loff = (size_t)l * p->seq_len * kv_dim;
-        float *k = m->key_cache + loff + (size_t)pos * kv_dim;
-        float *v = m->value_cache + loff + (size_t)pos * kv_dim;
+        size_t soff = (size_t)l * p->seq_len * p->n_kv_heads;
+        float *k = kv8 ? m->k : m->key_cache + loff + (size_t)pos * kv_dim;
+        float *v = kv8 ? m->v : m->value_cache + loff + (size_t)pos * kv_dim;
 
         matmul(m, m->q, m->xb, &w->wq, dim, dim);
         matmul(m, k, m->xb, &w->wk, dim, kv_dim);
@@ -390,10 +428,8 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         // RoPE
         for (int i = 0; i < dim; i += 2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = m->rope[head_dim];
+            float fci = m->rope[head_dim + 1];
             int rotn = i < kv_dim ? 2 : 1;
             for (int r = 0; r < rotn; r++) {
                 float *vec = r == 0 ? m->q : k;
@@ -404,14 +440,30 @@ float *llm_forward(LlmModel *m, int token, int pos) {
             }
         }
 
+        if (kv8) {
+            for (int kh = 0; kh < p->n_kv_heads; kh++) {
+                size_t at = loff + (size_t)pos * kv_dim + kh * head_size, st = soff + (size_t)pos * p->n_kv_heads + kh;
+                quantize_kv(k + kh * head_size, head_size, m->key_cache8 + at, m->key_scale + st);
+                quantize_kv(v + kh * head_size, head_size, m->value_cache8 + at, m->value_scale + st);
+            }
+        }
+
         // multihead attention
         for (int h = 0; h < p->n_heads; h++) {
+            int kh = h / kv_mul;
             float *q = m->q + h * head_size;
             float *att = m->att + h * p->seq_len;
             for (int t = 0; t <= pos; t++) {
-                float *kk = m->key_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+                size_t at = loff + (size_t)t * kv_dim + kh * head_size;
                 float score = 0.0f;
-                for (int i = 0; i < head_size; i++) score += q[i] * kk[i];
+                if (kv8) {
+                    const int8_t *kk = m->key_cache8 + at;
+                    for (int i = 0; i < head_size; i++) score += q[i] * I8F(kk[i]);
+                    score *= m->key_scale[soff + (size_t)t * p->n_kv_heads + kh];
+                } else {
+                    const float *kk = m->key_cache + at;
+                    for (int i = 0; i < head_size; i++) score += q[i] * kk[i];
+                }
                 score /= sqrtf(head_size);
                 att[t] = score;
             }
@@ -419,9 +471,16 @@ float *llm_forward(LlmModel *m, int token, int pos) {
             float *xb = m->xb + h * head_size;
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
-                float *vv = m->value_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+                size_t at = loff + (size_t)t * kv_dim + kh * head_size;
                 float a = att[t];
-                for (int i = 0; i < head_size; i++) xb[i] += a * vv[i];
+                if (kv8) {
+                    const int8_t *vv = m->value_cache8 + at;
+                    a *= m->value_scale[soff + (size_t)t * p->n_kv_heads + kh];
+                    for (int i = 0; i < head_size; i++) xb[i] += a * I8F(vv[i]);
+                } else {
+                    const float *vv = m->value_cache + at;
+                    for (int i = 0; i < head_size; i++) xb[i] += a * vv[i];
+                }
             }
         }
 

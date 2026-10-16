@@ -10,7 +10,7 @@ The Wii does technically have a GPU. Hollywood is fixed-function, with no shader
 
 <sub>The first run on real hardware: stories15M on the CPU engine, on a TV through an HDMI adapter. The GPU engines told garbage stories on that run (the self-test hashes on screen are wrong); see [Dolphin vs a real Wii](#dolphin-vs-a-real-wii) for why.</sub>
 
-**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 43.5 tok/s with stories15M, 5.9x the CPU alone. See [Speed](#speed-on-a-real-wii).
+**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 49.4 tok/s with stories15M, 6.6x the CPU alone. See [Speed](#speed-on-a-real-wii).
 
 ## Quick start
 
@@ -72,7 +72,7 @@ Each TEV stage computes `d ± lerp(a, b, c)` on 8-bit inputs, with an 11-bit sig
 - **Activations** go in the four konst colors, one byte per stage. Every row multiplies the same `x`, so it never needs to be a texture.
 - **Stage k** is `lerp(HALF, TEXC, KONST)` with a bias that cancels the HALF, so it adds exactly `±round(q * x_k / 256)` to the running sum. Sixteen stages make a 16-column pass per draw. Stage 0 starts the sum from a constant rather than from the PREV register, because a real Wii doesn't reset PREV between pixels.
 - **The CPU** copies the framebuffer back and adds up the passes in float, applying the weight and activation scales.
-- **The output layer** lets the framebuffer do that sum instead. Every pass draws into the same pixels and the blend unit adds it in, so the CPU reads one byte per row instead of one per pass. Blending can only add or subtract 8-bit pixels, clamped to 0..255, so the passes alternate: even passes add `c + P`, odd passes flip every stage's sign and subtract `c - P`, and the constant offsets `c` cancel in pairs. That takes one weight scale per row and one activation scale per token, and an 8-bit total is coarse, so the CPU recomputes the top 256 rows exactly.
+- **The output layer** lets the framebuffer do that sum instead. Every pass draws into the same pixels and the blend unit adds it in, so the CPU reads one byte per row instead of one per pass. Blending can only add or subtract 8-bit pixels, clamped to 0..255, so the passes alternate: even passes add `c + P`, odd passes flip every stage's sign and subtract `c - P`, and the constant offsets `c` cancel in pairs. That takes one weight scale per row and one activation scale per token, and an 8-bit total is coarse, so the CPU recomputes the top 256 rows exactly. Since its answer is only a shortlist, the output layer's textures are 16-bit RGB565, each weight rounded to a value a 5- or 6-bit channel can hold. That costs nothing measurable (the true best token is still in the top 256 every time) and takes a third off its GPU time.
 
 The catch is getting an 11-bit sum out through 8-bit pixels. There are two output modes, and the engine switch picks between them:
 
@@ -83,7 +83,7 @@ The catch is getting an 11-bit sum out through 8-bit pixels. There are two outpu
 | GPU, fast | Every weight matmul on the TEV. `clamp8`: 16 columns per draw, partial sums saturate past ±128, one weight scale per row. |
 | GPU, exact | `exact11`: 8 columns per draw, plus a second draw that writes the high bits, so sums are exact. About 2.4x the GPU work. |
 
-Both GPU engines run the output layer like split does. Attention, norms and SiLU stay on the CPU in every engine.
+Both GPU engines run the output layer like split does. Attention, norms and SiLU stay on the CPU in every engine. With int8 weights, the KV cache is int8 too, with one scale per head and position, and RoPE's rotations are computed once per token instead of in every layer.
 
 GPU fast leans on more of the hardware:
 
@@ -100,40 +100,53 @@ stories15M, 1,154 positions of fp32-sampled stories replayed through each engine
 | Engine | Top-1 agrees with fp32 | KL vs fp32 (nats) | Perplexity |
 |---|---|---|---|
 | fp32 CPU | 100% | 0 | 2.77 |
-| int8 CPU | 98.4% | 0.0005 | 2.77 |
-| split | 98.4% | 0.0046 | 2.78 |
-| GPU, fast | 92.2% | 0.027 | 2.84 |
-| GPU, exact | 97.0% | 0.0054 | 2.78 |
+| int8 CPU | 98.4% | 0.0007 | 2.77 |
+| split | 98.4% | 0.0047 | 2.78 |
+| GPU, fast | 93.1% | 0.028 | 2.85 |
+| GPU, exact | 97.1% | 0.0056 | 2.78 |
 
-The split engine matches int8 CPU on top-1 and tells the same greedy stories: the true best token was inside the blended output layer's top 64 at all 1,154 positions. KL is higher than int8's because tokens outside the top 256 keep their coarse logits. At the app's sampling settings (temperature 0.8, top-p 0.9), the sampling distribution sits nearly as close to fp32's as int8 CPU's does (total variation 0.010 vs 0.009, `tools/tev_sim/blend_sweep.py`). GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical. Before its layers got per-row scales, GPU fast scored 90.0% and 0.040.
+The split engine matches int8 CPU on top-1 and tells the same greedy stories: the true best token was inside the blended output layer's top 64 at all 1,154 positions. KL is higher than int8's because tokens outside the top 256 keep their coarse logits. At the app's sampling settings (temperature 0.8, top-p 0.9), the sampling distribution sits as close to fp32's as int8 CPU's does (total variation 0.012 for both; `tools/tev_sim/blend_sweep.py` has the sampler). GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical. Before its layers got per-row scales, GPU fast scored 90.6% and 0.039.
+
+The int8 KV cache and the 16-bit output layer barely register: int8 CPU's KL went from 0.0005 to 0.0007 and GPU fast's from 0.027 to 0.028, and the 16-bit output layer leaves split's numbers where 8-bit textures had them (KL 0.0047 vs 0.0048).
 
 ### Speed on a real Wii
 
 stories15M, int8, the bench's 64-token greedy story (see [below](#running-it-on-a-real-wii)):
 
-| Engine | tok/s | vs CPU | with blending | first run |
+| Engine | tok/s | vs CPU |
+|---|---|---|
+| CPU | 7.44 | 1x |
+| split | 16.06 | 2.2x |
+| GPU, fast | 49.41 | 6.6x |
+| GPU, exact | 21.91 | 2.9x |
+
+How it got there, one round of changes at a time:
+
+| Round | CPU | split | GPU, fast | GPU, exact |
 |---|---|---|---|---|
-| CPU | 7.41 | 1x | 7.41 | 7.41 |
-| split | 15.38 | 2.1x | 15.34 | 12.29 |
-| GPU, fast | 43.51 | 5.9x | 30.01 | 20.55 |
-| GPU, exact | 20.62 | 2.8x | 17.36 | 9.46 |
+| First run: the CPU sums every pass | 7.41 | 12.29 | 20.55 | 9.46 |
+| Blending the output layer's passes in the framebuffer | 7.41 | 15.34 | 30.01 | 17.36 |
+| GPU fast: per-row scales, paired-single readback, raw register writes, pipelining, MEM1 copies | 7.41 | 15.38 | 43.51 | 20.62 |
+| 16-bit output layer, int8 KV cache, RoPE once per token | 7.44 | 16.06 | 49.41 | 21.91 |
 
-The first run summed every pass on the CPU. Blending the output layer's passes in the framebuffer came next, then GPU fast's per-row scales, paired-single readback, raw register writes, pipelining and MEM1 copies ([above](#the-gpu)). Where a GPU-fast token's time goes:
+Where a GPU-fast token's time goes, in ms:
 
-| | now (23 ms) | with blending (33 ms) | first run (49 ms) |
-|---|---|---|---|
-| CPU issuing GX commands | 1.7 | 4.7 | 4.6 |
-| CPU waiting for the GPU | 9.7 | 9.6 | 9.9 |
-| CPU reading the framebuffer back and summing passes | 5.0 | 12.9 | 29.0 |
-| Everything else (attention, norms, SiLU, recomputing the top 256) | 6.6 | 6.0 | 5.1 |
+| | now (20 ms) | GPU fast round (23 ms) | blending (33 ms) | first run (49 ms) |
+|---|---|---|---|---|
+| CPU issuing GX commands | 1.7 | 1.7 | 4.7 | 4.6 |
+| CPU waiting for the GPU | 7.5 | 9.7 | 9.6 | 9.9 |
+| CPU reading the framebuffer back and summing passes | 5.0 | 5.0 | 12.9 | 29.0 |
+| Everything else (attention, norms, SiLU, recomputing the top 256) | 6.0 | 6.6 | 6.0 | 5.1 |
 
-Most of the waiting is the output layer, 6.4 ms of GPU time held back by texture fetch (below). The readback still costs about 21 cycles per pixel and pass against the 5 its instructions need, in cache misses on the copy. `tools/cost_model.py` is fitted to these runs and reproduces every engine within 2.5%. Fitted to the first run, it predicted blending's speedups within 4% before the code was written; it missed this last round by 17%, on the readback's misses and about 2.6 µs of GPU time per draw that nothing measured yet explains.
+The 16-bit output layer cut the waiting by 2.1 ms a token, just what the probe timed (below). The output layer is still more than half of it: 4.3 ms of GPU time, where the TEV alone would need 3.2. The readback costs about 21 cycles per pixel and pass against the 5 its instructions need, in cache misses on the copy.
+
+`tools/cost_model.py` is fitted to these runs and reproduces every engine in the last two rounds within 2.5%. Fitted to the first run, it predicted blending's speedups within 4% before the code was written. The next round it missed by 17%, on the readback's misses and about 2.6 µs of GPU time per draw that nothing measured yet explains. This round it missed by 3% (51 predicted, 49.4 measured): it read the float KV cache at main-memory speed, when at these positions it mostly sits in the L2 cache, so shrinking it saved less than expected. The model puts most of this round's 0.6 ms off "everything else" on RoPE's trig functions, though the bench can't tell the two apart. The KV cache should matter more later in a story, which the 64-token bench doesn't reach.
 
 ### What the probes measured
 
 `probe.txt` also times things that only the hardware can answer:
 
-- **The TEV isn't the limit; texture fetch is.** With no texture, or one small texture that stays in the cache, the output layer's 18 passes take 3.2 ms: 951 million pixel-stages a second, four pixels per GPU clock. Fetching the real RGBA8 textures from MEM2 doubles that to 6.4 ms. The same memory read as a 16-bit format (RGB565) takes 4.4 ms, and as an 8-bit one 3.9.
+- **The TEV isn't the limit; texture fetch is.** With no texture, or one small texture that stays in the cache, the output layer's 18 passes take 3.2 ms: 951 million pixel-stages a second, four pixels per GPU clock. Fetching RGBA8 textures from MEM2 doubled that to 6.4 ms. 16-bit RGB565 textures take 4.3 ms, so that's what the output layer uses now, and an 8-bit format would take 4.0.
 - **MEM2 is slow for the CPU.** Streaming reads run at 408 MB/s from MEM1 and 147 MB/s from MEM2. `dcbt` prefetching doesn't help either.
 - **Raw register writes** cost 1.7 µs per pass against 3.3 through libogc, with identical results. Draw-sync tokens work for pipelining.
 - **Locked-cache DMA crashes.** Broadway can lock half its L1 cache as a scratchpad and DMA into it, but on a Wii, libogc's `LCLoadData` ended in a Machine Check exception.
@@ -146,7 +159,7 @@ Put an empty `bench.txt` in `SD:/llama/` and the app runs every engine on the sa
 uv run tools/tev_sim/check_dolphin.py models/stories15M.bin models/tokenizer.bin bench_out.txt
 ```
 
-If the GPU engines disagree with the CPU, put an empty `probe.txt` in `SD:/llama/` as well. The app then runs `source/gx_probe.c` first: small draws that test texture sampling, the konst registers, a color register's value and how out-of-range pixels are written, one multiply-add stage over every weight byte, the exact11 halving stages and blending, plus raw dumps of real matmuls (each hashed three times, and two of them dumped as floats), then the timings above. It writes `SD:/llama/probe.bin` and `probe_out.txt`, and this says what came out different and how:
+If the GPU engines disagree with the CPU, put an empty `probe.txt` in `SD:/llama/` as well. The app then runs `source/gx_probe.c` first: small draws that test texture sampling, the konst registers, a color register's value and how out-of-range pixels are written, one multiply-add stage over every weight byte, the exact11 halving stages, blending and how 16-bit texels widen to 8 bits, plus raw dumps of real matmuls (each hashed three times, and two of them dumped as floats), then the timings above. It writes `SD:/llama/probe.bin` and `probe_out.txt`, and this says what came out different and how:
 
 ```sh
 uv run tools/tev_sim/check_probe.py models/stories15M.bin probe.bin
@@ -163,15 +176,15 @@ The Wii has 24 MB MEM1 + 64 MB MEM2. After the system and the app take their sha
 | Model | int8 (default) | fp32 |
 |---|---|---|
 | stories260K | ~1 MB | ~1 MB |
-| stories15M | ~20 MB | ~61 MB (very tight, may not fit) |
-| stories42M | ~53 MB | won't fit |
+| stories15M | ~17 MB | ~61 MB (very tight, may not fit) |
+| stories42M | ~47 MB | won't fit |
 | stories110M | ~136 MB, won't fit | won't fit |
 
-The GPU engines need their own copy of the weights as textures, about 1.4 bytes per weight, and GPU fast keeps a second copy of the layers with per-row scales. stories15M takes ~28 MB of textures on top of its ~20 MB, which fits, with about 1 MB of MEM1 and 23 MB of MEM2 left over. stories42M doesn't, so it runs CPU only (the app uploads what fits and tells you).
+The GPU engines need their own copy of the weights as textures, about 1.4 bytes per weight (0.7 for the output layer's 16-bit ones), and GPU fast keeps a second copy of the layers with per-row scales. stories15M takes ~22 MB of textures on top of its ~17 MB, which fits, with about 2 MB of MEM1 and 30 MB of MEM2 left over. stories42M doesn't, so it runs CPU only (the app uploads what fits and tells you).
 
 int8 is the default because it's about 4x smaller, and it should be faster too. Its inner loop costs ~3.3 cycles per multiply-add, because Broadway has one load/store unit and int8 needs three loads per multiply-add, versus ~2.1 cycles for fp32. But fp32 moves 4x the bytes, so it only wins if the CPU can stream memory at nearly the bus's full 1.9 GB/s, which an in-order core without prefetching shouldn't manage. Paired-singles dequantization (see below) would cut int8's loads.
 
-The exporter caps context at 256 tokens (`--seq-len`), which is about one TV screen of text. The KV cache grows with context: at its native 1024, stories42M's cache alone would be ~34 MB and the model wouldn't fit.
+The exporter caps context at 256 tokens (`--seq-len`), which is about one TV screen of text. The KV cache grows with context. An int8 model keeps it in int8 as well, a quarter of the fp32 size, so at its native 1024, stories42M's cache would be ~9 MB instead of ~34, and the whole model ~53 MB.
 
 stories260K uses its own 512-token tokenizer (`tok512.bin`, in the same Hugging Face repo), not the default `tokenizer.bin`. Its group size (4) is too small for the GPU path, so it's CPU only.
 
@@ -211,7 +224,7 @@ Output was compared token for token, with greedy decoding and seeded sampling, a
 
 The GPU path was checked in layers:
 
-- **The TEV math.** `tools/tev_sim/tev.py` follows the combiner arithmetic in Dolphin's software renderer (`Tev.cpp`). The probes confirmed it on a real Wii: one multiply-add stage for all 256 weight bytes against 10 activation values in both signs, the halving stages, and out-of-range writes, which wrap like a u8 cast.
+- **The TEV math.** `tools/tev_sim/tev.py` follows the combiner arithmetic in Dolphin's software renderer (`Tev.cpp`). The probes confirmed it on a real Wii: one multiply-add stage for all 256 weight bytes against 10 activation values in both signs, the halving stages, out-of-range writes (they wrap like a u8 cast) and RGB565 texels (they widen to 8 bits by repeating their top bits).
 - **The simulator against Dolphin.** Run in Dolphin, the Wii build's integer outputs match the simulator bit for bit: the pass sums for two matrix shapes in both output modes, and the blended output layer's framebuffer. So do the float outputs of a whole matmul in both modes, down to the last bit, since the simulator rounds the way Broadway's fused multiply-add does. Over 64 greedy tokens, three of the four engines tell the same story as the simulator. GPU fast drifts off after about 20 tokens: it requantizes activations to 8 bits at every layer, so one rounding that goes the other way, from float differences between numpy and C outside the matmuls, gives the rest of the story different quantization noise.
 - **The simulator against a real Wii.** The same integer hashes, probe images and float outputs, bit for bit. The Wii's text output is identical to Dolphin's for all four engines.
 - **The simulator against the C engine.** The numpy port in `tools/tev_sim/llama.py` reproduces the C engine's greedy stories exactly, fp32 and int8.
@@ -238,7 +251,7 @@ Note that the default build sums each matmul row with 4 accumulators for speed, 
 
 ## Ideas for next steps
 
-- **Feed the TEV faster.** The output layer spends half its GPU time waiting on texture fetch. The GPU can bulk-load textures into its 1 MB of texture memory ahead of a draw (one output-layer pass is 683 KB), which might let the TEV run at its full rate. The output layer is coarse anyway, so a 16-bit texture format would also do, at 5 or 6 bits per weight.
+- **Feed the TEV faster.** Even with 16-bit textures, the output layer spends a quarter of its GPU time waiting on texture fetch. The GPU can bulk-load textures into its 1 MB of texture memory ahead of a draw (one output-layer pass is 342 KB now), which might let the TEV run at its full rate.
 - **Fewer, bigger draws.** q, k and v multiply the same input, and so do the FFN's w1 and w3. Stacking each group's rows into one matrix would cut GPU fast's draws per token by a third, and the cost model puts ~2.6 µs on each.
 - **Paired singles for the CPU matmul.** The readback uses `psq_lx` now, but `matmul_q8` still converts int8 weights through a lookup table. `psq_l` can load two int8 values as floats in one instruction, which would cut the CPU engine's loads by more than half.
 - **The locked cache, done right.** Locked-cache DMA crashed on a Wii (above). If it can be made to work, double-buffering weights through it could hide the CPU's memory stalls, which `dcbt` can't.

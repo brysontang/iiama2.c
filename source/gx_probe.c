@@ -4,7 +4,7 @@
 // framebuffer bytes are known in advance and dumps the raw copy to
 // SD:/llama/probe.bin; tools/tev_sim/check_probe.py says what came out
 // differently. The probes split the matmul into its parts: texture sampling,
-// the konst registers, a color register's value and how the framebuffer write
+// RGB565 texels, the konst registers, a color register's value and how the framebuffer write
 // wraps, one multiply stage, the exact11 halving stages, and blending. The real
 // matmuls from the selftest are dumped too, and hashed more than once to see if
 // the GPU is even deterministic. Then timings: raw register writes vs libogc's
@@ -140,6 +140,30 @@ static void probe_texture(void) {
         quad(j * pw, 0, pw, ph, 0.0f, 1.0f / 8, 0.0f, 1.0f);
     }
     copy_out("tex", tw, ph);
+    free(tex);
+}
+
+// RGB565 texels, as the blended output layer stores its weights, drawn straight through so the copy
+// shows how the texture unit widens them to 8 bits. Texel x of a 64 x 4 texture holds
+// r = x & 31, g = x, b = 31 - (x & 31), every row alike.
+static void probe_rgb565(void) {
+    const int tw = 64, th = 4;
+    uint16_t *tex = (uint16_t *)memalign(32, tw * th * 2);
+    for (int y = 0; y < th; y++)
+        for (int x = 0; x < tw; x++)
+            tex[((y >> 2) * (tw >> 2) + (x >> 2)) * 16 + ((y & 3) << 2) + (x & 3)] =
+                (uint16_t)((x & 31) << 11 | x << 5 | (31 - (x & 31)));
+    DCFlushRange(tex, tw * th * 2);
+    GXTexObj obj;
+    GX_InitTexObj(&obj, tex, tw, th, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&obj, GX_NEAR, GX_NEAR);
+    GX_LoadTexObj(&obj, GX_TEXMAP0);
+    GX_InvalidateTexAll();
+    GX_SetNumTevStages(1);
+    stage(0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+    quad(0, 0, tw, th, 0.0f, 1.0f, 0.0f, 1.0f);
+    copy_out("rgb565", tw, th);
     free(tex);
 }
 
@@ -316,12 +340,12 @@ static void probe_memory(LlmModel *m) {
 // What limits the TEV: the blended output layer's passes with fewer stages, without textures, with one
 // small texture that stays cached, and with the same texture memory read as smaller texel formats.
 static void probe_rate(LlmModel *m) {
+    // The output layer's textures are RGB565 (16 bits a texel); reading them as I8 halves the bytes again.
     static const struct { const char *name; int stages, fmt, tiny; } v[] = {
-        {"RGBA8, 16 stages", 16, GX_TF_RGBA8, 0},    {"RGBA8, 8 stages", 8, GX_TF_RGBA8, 0},
-        {"RGBA8, 4 stages", 4, GX_TF_RGBA8, 0},      {"RGBA8, 1 stage", 1, GX_TF_RGBA8, 0},
+        {"RGB565, 16 stages", 16, GX_TF_RGB565, 0},  {"RGB565, 8 stages", 8, GX_TF_RGB565, 0},
+        {"RGB565, 4 stages", 4, GX_TF_RGB565, 0},    {"RGB565, 1 stage", 1, GX_TF_RGB565, 0},
         {"no texture, 16 stages", 16, -1, 0},        {"one small texture, 16 stages", 16, GX_TF_RGBA8, 1},
-        {"read as RGB565, 16 stages", 16, GX_TF_RGB565, 0}, {"read as IA8, 16 stages", 16, GX_TF_IA8, 0},
-        {"read as I8, 16 stages", 16, GX_TF_I8, 0},  {"RGBA8, 16 stages again", 16, GX_TF_RGBA8, 0},
+        {"read as I8, 16 stages", 16, GX_TF_I8, 0},  {"RGB565, 16 stages again", 16, GX_TF_RGB565, 0},
     };
     if (!m->cls.gpu) return;
     for (int i = 0; i < (int)(sizeof(v) / sizeof(v[0])); i++)
@@ -382,6 +406,7 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     log("probe: TEV arithmetic\n");
 
     probe_texture();
+    probe_rgb565();
     probe_konst();
     probe_reg();
     probe_arith();

@@ -45,8 +45,8 @@ void gxm_set_raw_issue(int on);
 int gxm_tokens_failed(void); // draw-sync tokens timed out, so matmuls fell back to GX_DrawDone
 
 // Also for gx_probe.c: a matrix's texture memory, and how long (ms) the GPU takes to draw a blended
-// matrix's passes with `stages` TEV stages, sampling its textures (fmt GX_TF_RGBA8, or the same memory
-// read as a smaller texel format), one small texture over and over (tiny), or no texture (fmt < 0).
+// matrix's passes with `stages` TEV stages, sampling its textures (fmt = their own format, or the same
+// memory read as another format no bigger), one small texture over and over (tiny), or none (fmt < 0).
 const void *gxm_texture_memory(void *gpu, size_t *bytes);
 float gxm_time_draws(void *gpu, int stages, int fmt, int tiny);
 

@@ -167,7 +167,7 @@ def main():
     ap.add_argument("--group-size", type=int, default=32, help="q8 quantization group size (default 32)")
     ap.add_argument("--seq-len", type=int, default=256,
                     help="max tokens per story (default 256, about one TV screen of text). The KV cache "
-                         "grows with this, e.g. stories42M needs ~34 MB of cache at its native 1024.")
+                         "grows with this, e.g. stories42M needs ~9 MB of int8 cache at its native 1024.")
     args = ap.parse_args()
 
     cfg, w = read_llama2c_checkpoint(args.checkpoint)
@@ -183,7 +183,9 @@ def main():
         sys.exit(f"tokenizer has {n_tok} tokens but model vocab is {cfg['vocab_size']}: wrong tokenizer?")
 
     kv_dim = cfg["dim"] * cfg["n_kv_heads"] // cfg["n_heads"]
-    kv_bytes = 2 * cfg["n_layers"] * cfg["seq_len"] * kv_dim * 4
+    # int8 models keep an int8 KV cache, one fp32 scale per head per position
+    per_pos = kv_dim + 4 * cfg["n_kv_heads"] if dtype == DTYPE_Q8 else kv_dim * 4
+    kv_bytes = 2 * cfg["n_layers"] * cfg["seq_len"] * per_pos
     total_mb = (stats["bytes"] + kv_bytes) / 2**20
     print(f"config  : {cfg}")
     print(f"weights : {args.dtype}" + (f", group size {gs}, max abs error {stats['max_err']:.2e}" if gs else ""))

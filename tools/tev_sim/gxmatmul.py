@@ -162,7 +162,18 @@ class TevMatrix:
 # The blended classifier's settings in source/gx_matmul.c, and how many candidates the CPU recomputes
 # exactly (LlmModel.rescore_k). tools/tev_sim/blend_sweep.py picked them: with these, the app's sampler
 # (temperature 0.8, top-p 0.9) matches fp32's as closely as the old 18-bytes-per-row classifier did.
-BLEND = {"headroom": 0.25, "a0": 32, "c0": 32}
+BLEND = {"headroom": 0.25, "a0": 32, "c0": 32, "rgb565": True}
+
+# RGB565 texels expand to 8 bits by repeating their top bits (Dolphin's Convert5To8 / Convert6To8)
+E5 = np.array([(c << 3) | (c >> 2) for c in range(32)])
+E6 = np.array([(c << 2) | (c >> 4) for c in range(64)])
+
+
+def snap(v, grid):
+    """The nearest value of `grid` (ascending) for each element of v, the lower one on a tie (gx_matmul.c's rgb565_code)."""
+    i = np.clip(np.searchsorted(grid, v), 1, len(grid) - 1)
+    lo, hi = grid[i - 1], grid[i]
+    return np.where(np.abs(v - lo) <= np.abs(hi - v), lo, hi)
 RESCORE_K = 256
 
 
@@ -183,16 +194,25 @@ class BlendMatrix:
     for x: the weights are requantized per row (from the CPU's per-group
     int8), and x gets a single scale for all columns, with a small headroom so
     whole-row sums fit in the byte.
+
+    rgb565: the textures are RGB565, half the bytes of RGBA8, which matters
+    because fetching them is what limits the GPU here. Each texture byte
+    becomes the nearest value a 5-bit (rows in R and B) or 6-bit (G) channel
+    expands to. The CPU recomputes the top candidates exactly anyway.
     """
 
     cols = 16
 
-    def __init__(self, w_f32, headroom=BLEND["headroom"], a0=BLEND["a0"], c0=BLEND["c0"], group_size=32):
+    def __init__(self, w_f32, headroom=BLEND["headroom"], a0=BLEND["a0"], c0=BLEND["c0"], group_size=32,
+                 rgb565=BLEND["rgb565"]):
         rows, n = w_f32.shape
         assert n % self.cols == 0
         self.n, self.headroom, self.a0, self.c0 = n, headroom, a0, c0
         qr, self.s = requantize_rows(w_f32, group_size)  # self.s: (rows,)
         self.wu = (qr.astype(np.int32) + 128).reshape(rows, -1, self.cols)
+        if rgb565:  # row r lives in channel r % 3 of its pixel
+            for ch, grid in enumerate((E5, E6, E5)):
+                self.wu[ch::3] = snap(self.wu[ch::3], grid)
         self.passes = n // self.cols
         self.stats = {"calls": 0, "partials": 0, "saturated": 0}
 
