@@ -24,16 +24,15 @@ import re
 import sys
 
 import numpy as np
-from gxmatmul import GPU, Split, TevMatrix
+from gxmatmul import BLEND, GPU, RESCORE_K, BlendMatrix, Split, TevMatrix
 from llama import Q8, Tokenizer, Weights, generate
 
 # must match ENGINES in source/main.c
 ENGINES = [
     ("CPU", lambda W: Q8(W)),
-    ("split (GPU classifier + CPU top-64)", lambda W: Split(W, "clamp8", 0.5, 16, 64)),
-    ("GPU, fast (clamp8)", lambda W: GPU(W, "clamp8", 0.5, 16)),
-    ("GPU, exact (exact11)", lambda W: GPU(W, "exact11", 1.0, 8)),
-    ("GPU, exact + CPU top-64", lambda W: GPU(W, "exact11", 1.0, 8, rescore_k=64)),
+    ("split (GPU classifier + CPU top-256)", lambda W: Split(W, "blend", BLEND["headroom"], 16, RESCORE_K)),
+    ("GPU, fast (clamp8)", lambda W: GPU(W, "clamp8", 0.5, 16, rescore_k=RESCORE_K, blend_cls=True)),
+    ("GPU, exact (exact11)", lambda W: GPU(W, "exact11", 1.0, 8, rescore_k=RESCORE_K, blend_cls=True)),
 ]
 CHECKS = [("clamp8", 0.5, 16), ("exact11", 1.0, 8)]
 
@@ -48,9 +47,10 @@ def fnv1a_partials(partial):
 def selftest(W):
     n = max(W.dim, W.hidden)
     x = ((((np.arange(n) * 37) % 101) - 50) / 16.0).astype(np.float32)
-    out = {}
+    m = BlendMatrix(W.f32["cls"])
+    out = {("blend", "cls"): f"{fnv1a_partials(m.tev_partials(x[: m.n])[0]):08x}"}
     for mode, headroom, cols in CHECKS:
-        for name, key in (("cls", "cls"), ("w1", ("w1", 0)), ("w2", ("w2", 0))):
+        for name, key in (("w1", ("w1", 0)), ("w2", ("w2", 0))):
             m = TevMatrix(W.f32[key], mode, headroom, cols)
             partial, _ = m.tev_partials(x[: m.n])
             out[(mode, name)] = f"{fnv1a_partials(partial):08x}"
@@ -60,7 +60,7 @@ def selftest(W):
 def parse_bench(text):
     hashes, stories = {}, {}
     for line in text.splitlines():
-        m = re.match(r"selftest (\w+) headroom [\d.]+: (.*)", line)
+        m = re.match(r"selftest (\w+)(?: headroom [\d.]+)?: (.*)", line)
         if m:
             for name, h in re.findall(r"(\w+) ([0-9a-f]{8})", m.group(2)):
                 hashes[(m.group(1), name)] = h

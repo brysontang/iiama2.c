@@ -44,7 +44,9 @@ static const char *PROMPTS[] = {
 };
 #define N_PROMPTS ((int)(sizeof(PROMPTS) / sizeof(PROMPTS[0])))
 
-// Where the matmuls run. tools/tev_sim/eval.py measures what each costs in accuracy.
+// Where the matmuls run. tools/tev_sim/eval.py measures what each costs in accuracy. The GPU engines
+// all run the classifier blended (coarse logits for the whole vocab) and recompute the top 256 exactly
+// on the CPU; out_mode and headroom are for the transformer layers.
 typedef struct {
     const char *name;
     int mode, out_mode;
@@ -54,10 +56,9 @@ typedef struct {
 
 static const Engine ENGINES[] = {
     {"CPU", LLM_MODE_CPU, GXM_CLAMP8, 0.5f, 0},
-    {"split (GPU classifier + CPU top-64)", LLM_MODE_SPLIT, GXM_CLAMP8, 0.5f, 64},
-    {"GPU, fast (clamp8)", LLM_MODE_GPU, GXM_CLAMP8, 0.5f, 0},
-    {"GPU, exact (exact11)", LLM_MODE_GPU, GXM_EXACT11, 1.0f, 0},
-    {"GPU, exact + CPU top-64", LLM_MODE_GPU, GXM_EXACT11, 1.0f, 64},
+    {"split (GPU classifier + CPU top-256)", LLM_MODE_SPLIT, GXM_CLAMP8, 0.5f, 256},
+    {"GPU, fast (clamp8)", LLM_MODE_GPU, GXM_CLAMP8, 0.5f, 256},
+    {"GPU, exact (exact11)", LLM_MODE_GPU, GXM_EXACT11, 1.0f, 256},
 };
 #define N_ENGINES ((int)(sizeof(ENGINES) / sizeof(ENGINES[0])))
 
@@ -336,14 +337,12 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         for (int j = 0; j < n; j++) x[j] = (float)(((j * 37) % 101) - 50) / 16.0f;
         static const struct { int mode; float headroom; const char *name; } checks[] = {
             {GXM_CLAMP8, 0.5f, "clamp8"}, {GXM_EXACT11, 1.0f, "exact11"}};
-        for (int i = 0; i < 2; i++) {
+        report("selftest blend: cls %08lx\n", (unsigned long)gxm_partials_hash(m->cls.gpu, x));
+        for (int i = 0; i < 2 && g_gpu_layers; i++) {
             gxm_set_mode(checks[i].mode, checks[i].headroom);
-            report("selftest %s headroom %.2f: cls %08lx", checks[i].name, checks[i].headroom,
-                   (unsigned long)gxm_partials_hash(m->cls.gpu, x));
-            if (g_gpu_layers)
-                report(" w1 %08lx w2 %08lx", (unsigned long)gxm_partials_hash(m->layers[0].w1.gpu, x),
-                       (unsigned long)gxm_partials_hash(m->layers[0].w2.gpu, x));
-            report("\n");
+            report("selftest %s headroom %.2f: w1 %08lx w2 %08lx\n", checks[i].name, checks[i].headroom,
+                   (unsigned long)gxm_partials_hash(m->layers[0].w1.gpu, x),
+                   (unsigned long)gxm_partials_hash(m->layers[0].w2.gpu, x));
         }
         free(x);
     }

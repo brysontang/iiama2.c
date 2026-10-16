@@ -20,8 +20,9 @@ through each backend and compares next-token distributions against fp32:
 
 Then shows greedy stories from each backend so you can read the damage.
 
-Variants are kind:mode:cols:headroom[:k], e.g. split:clamp8:16:0.5:64 or
-gpu:exact11:8:1.0. kind is split, gpu, or gpu+rescore.
+Variants are kind:mode:cols:headroom[:k], e.g. split:blend:16:0.25:256 or
+gpu:exact11:8:1.0. kind is split, gpu, gpu+rescore, or gpu+blend (the classifier
+blended, with the CPU recomputing its top k; mode is the layers').
 """
 import argparse
 import json
@@ -30,14 +31,15 @@ import time
 
 import numpy as np
 import tev
-from gxmatmul import GPU, Split, TevMatrix
+from gxmatmul import GPU, BlendMatrix, Split, TevMatrix
 from llama import F32, Q8, Tokenizer, Transformer, Weights, generate, softmax
 
 PROMPTS = ["Once upon a time", "The grumpy turtle king", "One day, a little girl named Lily",
            "Tom and his dog went to the park", "There was a brave little robot", ""]
 
-DEFAULT_VARIANTS = ["split:clamp8:16:0.5:64", "split:exact11:8:1.0:64",
-                    "gpu:clamp8:16:0.5", "gpu:clamp8:8:0.7", "gpu:exact11:8:1.0", "gpu+rescore:exact11:8:1.0:64"]
+# the app's engines (source/main.c), then the ones they replaced
+DEFAULT_VARIANTS = ["split:blend:16:0.25:256", "gpu+blend:clamp8:16:0.5:256", "gpu+blend:exact11:8:1.0:256",
+                    "split:clamp8:16:0.5:64", "gpu:clamp8:16:0.5", "gpu:exact11:8:1.0"]
 
 
 def make_backend(W, spec):
@@ -53,6 +55,8 @@ def make_backend(W, spec):
         return GPU(W, mode, headroom, cols)
     if kind == "gpu+rescore":
         return GPU(W, mode, headroom, cols, rescore_k=int(k[0]) if k else 64)
+    if kind == "gpu+blend":
+        return GPU(W, mode, headroom, cols, rescore_k=int(k[0]) if k else 256, blend_cls=True)
     raise SystemExit(f"unknown variant {spec}")
 
 
@@ -83,6 +87,8 @@ def classifier_recall(W, seqs, specs, ks=(1, 4, 16, 64)):
 
     def tev_cls(spec):
         mode, cols, headroom = spec.split(":")
+        if mode == "blend":
+            return BlendMatrix(W.f32["cls"], float(headroom))
         return TevMatrix(W.f32["cls"], mode, float(headroom), int(cols))
 
     tevs = {s: tev_cls(s) for s in specs}
@@ -179,7 +185,7 @@ def main():
     ref = replay(W, F32(W), seqs)
 
     t0 = time.time()
-    results["classifier"] = classifier_recall(W, seqs, ["clamp8:16:0.5", "clamp8:8:0.7", "exact11:8:1.0"])
+    results["classifier"] = classifier_recall(W, seqs, ["blend:16:0.25", "clamp8:16:0.5", "exact11:8:1.0"])
     log(f"classifier recall: {time.time() - t0:.0f}s")
 
     backends = {}

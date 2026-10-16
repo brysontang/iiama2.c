@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from cost_model import region
 from export_wii import quantize_q8
-from gxmatmul import quantize_x
+from gxmatmul import BlendMatrix, quantize_x
 from llama import Weights
 from tev import (
     BIAS_ADDHALF,
@@ -46,6 +46,10 @@ from tev import (
 PREV_VALUES = [(77, 150, 200), (-50, 300, 1000), (-1, 256, 511), (0, 255, -1024),
                (1023, -129, 128), (-200, 600, 384), (129, 383, -256), (640, -640, 3)]
 KONST_VALUES = [0, 1, 2, 64, 127, 128, 129, 200, 254, 255]
+BLEND_VALUES = [((10, 100, 200), (20, 100, 100), (5, 250, 0)), ((255, 0, 128), (1, 0, 127), (0, 1, 255)),
+                ((128, 64, 32), (127, 191, 223), (200, 100, 50)), ((0, 0, 0), (0, 255, 1), (1, 255, 0)),
+                ((200, 50, 250), (100, 50, 10), (150, 49, 255)), ((77, 33, 99), (88, 44, 11), (66, 22, 0)),
+                ((255, 255, 255), (255, 255, 255), (255, 0, 1)), ((1, 2, 3), (4, 5, 6), (7, 8, 9))]
 
 
 def read_probe(path):
@@ -160,6 +164,27 @@ def expected_div():
     return e
 
 
+def expected_blend():
+    """Row 0: D, then + S, then - T. Row 1: D, then - S, then + T. Saturating after each step."""
+    e = np.zeros((8, 4 * len(BLEND_VALUES), 3), np.int32)
+    for i, (d, s_, t) in enumerate(BLEND_VALUES):
+        d, s_, t = np.array(d), np.array(s_), np.array(t)
+        e[0:4, i * 4:i * 4 + 4] = np.maximum(np.minimum(d + s_, 255) - t, 0)
+        e[4:8, i * 4:i * 4 + 4] = np.minimum(np.maximum(d - s_, 0) + t, 255)
+    return e
+
+
+def blend_efb(w, x):
+    """The blended classifier's framebuffer: one byte per row, 3 rows per pixel."""
+    m = BlendMatrix(w)
+    m.tev_sums(x[: m.n])
+    rows = w.shape[0]
+    pw, ph = region(rows)
+    acc = np.full(pw * ph * 3, -1, np.int32)
+    acc[:rows] = m.last_acc
+    return acc.reshape(ph, pw, 3)
+
+
 def compare(name, got, exp, show=8):
     mask = exp >= 0
     bad = (got != exp) & mask
@@ -184,7 +209,7 @@ def main():
 
     got = read_probe(args.probe_bin)
     simple = {"tex": expected_tex, "konst": expected_konst, "reg": expected_reg, "arith": expected_arith,
-              "div": expected_div}
+              "div": expected_div, "blend": expected_blend}
     for name, fn in simple.items():
         if name in got:
             compare(name, got[name], fn())
@@ -192,6 +217,12 @@ def main():
     W = Weights(args.checkpoint)
     n = max(W.dim, W.hidden)
     x = ((((np.arange(n) * 37) % 101) - 50) / 16.0).astype(np.float32)
+    if "cls_bl" in got:
+        exp = blend_efb(W.f32["cls"], x)
+        if got["cls_bl"].shape != exp.shape:
+            print(f"cls_bl   copy is {got['cls_bl'].shape[1]}x{got['cls_bl'].shape[0]}, expected {exp.shape[1]}x{exp.shape[0]}")
+        else:
+            compare("cls_bl", got["cls_bl"], exp, show=4)
     for name, key, mode in (("w1_c8", ("w1", 0), "c8"), ("cls_c8", "cls", "c8"), ("w1_e11", ("w1", 0), "e11")):
         if name not in got:
             continue

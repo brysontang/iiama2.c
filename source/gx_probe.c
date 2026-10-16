@@ -5,9 +5,10 @@
 // SD:/llama/probe.bin; tools/tev_sim/check_probe.py says what came out
 // differently. The probes split the matmul into its parts: texture sampling,
 // the konst registers, a color register's value and how the framebuffer write
-// wraps, one multiply stage, and the exact11 halving stages. The real matmuls
-// from the selftest are dumped too, and hashed more than once to see if the
-// GPU is even deterministic.
+// wraps, one multiply stage, the exact11 halving stages, and blending. The real
+// matmuls from the selftest are dumped too, and hashed more than once to see if
+// the GPU is even deterministic. Last, a CPU memory bandwidth test, with and
+// without dcbt prefetching.
 #include "gx_probe.h"
 
 #include <malloc.h>
@@ -15,6 +16,7 @@
 #include <string.h>
 
 #include <gccore.h>
+#include <ogc/lwp_watchdog.h>
 
 #include "gx_matmul.h"
 
@@ -80,25 +82,23 @@ static void c0_init(s16 r, s16 g, s16 b) {
 }
 
 // The real thing: raw framebuffer copies of selftest matmuls, and repeated hashes.
+static void dump_matmul(void *gpu, const char *name, const float *x) {
+    uint32_t h[3];
+    for (int r = 0; r < 3; r++) h[r] = gxm_partials_hash(gpu, x);
+    g_log("hash %s: %08lx %08lx %08lx\n", name, (unsigned long)h[0], (unsigned long)h[1], (unsigned long)h[2]);
+    int w, hh;
+    const uint8_t *buf = gxm_last_copy(&w, &hh);
+    section(name, buf, w, hh);
+}
+
 static void probe_matmuls(LlmModel *m, const float *x) {
-    static const struct { int mode; float headroom; const char *name; } modes[] = {
-        {GXM_CLAMP8, 0.5f, "c8"}, {GXM_EXACT11, 1.0f, "e11"}};
-    for (int i = 0; i < 2; i++) {
-        gxm_set_mode(modes[i].mode, modes[i].headroom);
-        struct { void *gpu; const char *name; } mats[2] = {{m->layers[0].w1.gpu, "w1"}, {m->cls.gpu, "cls"}};
-        for (int k = 0; k < 2; k++) {
-            if (!mats[k].gpu || (modes[i].mode == GXM_EXACT11 && k == 1)) continue; // cls exact11 takes several copies
-            char name[16];
-            uint32_t h[3];
-            for (int r = 0; r < 3; r++) h[r] = gxm_partials_hash(mats[k].gpu, x);
-            g_log("hash %s %s: %08lx %08lx %08lx\n", mats[k].name, modes[i].name, (unsigned long)h[0],
-                  (unsigned long)h[1], (unsigned long)h[2]);
-            int w, hh;
-            const uint8_t *buf = gxm_last_copy(&w, &hh);
-            snprintf(name, sizeof(name), "%s_%s", mats[k].name, modes[i].name);
-            section(name, buf, w, hh);
-        }
+    if (m->layers[0].w1.gpu) {
+        gxm_set_mode(GXM_CLAMP8, 0.5f);
+        dump_matmul(m->layers[0].w1.gpu, "w1_c8", x);
+        gxm_set_mode(GXM_EXACT11, 1.0f);
+        dump_matmul(m->layers[0].w1.gpu, "w1_e11", x);
     }
+    dump_matmul(m->cls.gpu, "cls_bl", x); // the blended classifier: one copy, one byte per row
 }
 
 // Texture sampling exactly as the matmul does it: 8 planes side by side, texcoord j shifted by j/8.
@@ -221,6 +221,61 @@ static void probe_div(void) {
     copy_out("div", 4 * N_PREV, 4);
 }
 
+// Blending the way the classifier uses it, on known values. Each 4x4 quad gets three draws: a plain
+// write of D, then S and T blended. Row 0 adds S and subtracts T; row 1 subtracts S and adds T.
+// Expect each step to saturate at 0 and 255.
+static const s16 BLEND_VALUES[][3][3] = { // [quad][D, S, T][r, g, b]
+    {{10, 100, 200}, {20, 100, 100}, {5, 250, 0}},    {{255, 0, 128}, {1, 0, 127}, {0, 1, 255}},
+    {{128, 64, 32}, {127, 191, 223}, {200, 100, 50}}, {{0, 0, 0}, {0, 255, 1}, {1, 255, 0}},
+    {{200, 50, 250}, {100, 50, 10}, {150, 49, 255}},  {{77, 33, 99}, {88, 44, 11}, {66, 22, 0}},
+    {{255, 255, 255}, {255, 255, 255}, {255, 0, 1}},  {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}};
+#define N_BLEND (int)(sizeof(BLEND_VALUES) / sizeof(BLEND_VALUES[0]))
+
+static void probe_blend(void) {
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+    stage(0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_C0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE);
+    for (int row = 0; row < 2; row++) {
+        for (int i = 0; i < N_BLEND; i++) {
+            for (int step = 0; step < 3; step++) {
+                const s16 *v = BLEND_VALUES[i][step];
+                u8 mode = step == 0 ? GX_BM_NONE : (step == 1) == (row == 0) ? GX_BM_BLEND : GX_BM_SUBTRACT;
+                GX_SetBlendMode(mode, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
+                c0_init(v[0], v[1], v[2]);
+                quad(i * 4, row * 4, 4, 4, 0, 0, 0, 0);
+            }
+        }
+    }
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    copy_out("blend", 4 * N_BLEND, 8);
+}
+
+// CPU streaming reads over the classifier's weights (much bigger than the 256 KB L2), plain and with
+// dcbt touching N cache lines ahead. The CPU matmul and the readback both stream like this.
+static uint32_t stream(const uint32_t *w, size_t words, int ahead) {
+    uint32_t s = 0;
+    for (size_t i = 0; i < words; i += 8) {
+        if (ahead) __asm__ volatile("dcbt 0,%0" : : "r"(w + i + 8 * ahead));
+        s += w[i] + w[i + 1] + w[i + 2] + w[i + 3] + w[i + 4] + w[i + 5] + w[i + 6] + w[i + 7];
+    }
+    return s;
+}
+
+static void probe_memory(LlmModel *m) {
+    const uint32_t *w = m->cls.q ? (const uint32_t *)m->cls.q : (const uint32_t *)m->cls.f;
+    size_t bytes = (size_t)m->c.vocab_size * m->c.dim * (m->cls.q ? 1 : 4) & ~(size_t)31;
+    static const int ahead[] = {0, 1, 2, 4, 8, 16, 0};
+    volatile uint32_t sink = 0;
+    for (int i = 0; i < (int)(sizeof(ahead) / sizeof(ahead[0])); i++) {
+        uint64_t t0 = gettime();
+        sink += stream(w, bytes / 4, ahead[i]);
+        uint64_t t1 = gettime();
+        g_log("memory: %lu KB, dcbt %2d lines ahead: %lu MB/s\n", (unsigned long)(bytes / 1024), ahead[i],
+              (unsigned long)(bytes / ticks_to_microsecs(t1 - t0)));
+    }
+    (void)sink;
+}
+
 int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     g_log = log;
     g_out = fopen(bin_path, "wb");
@@ -244,7 +299,9 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     probe_reg();
     probe_arith();
     probe_div();
+    probe_blend();
     gxm_forget_layout();
+    probe_memory(m);
 
     fclose(g_out);
     free(g_buf);

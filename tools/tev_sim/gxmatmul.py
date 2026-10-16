@@ -26,6 +26,10 @@ Output modes, i.e. how each pass's 11-bit PREV gets out through 8-bit pixels:
   exact11  8 columns/pass, 2 draws: one writes PREV's low byte (u8 wrap), one
            runs 3 extra halving stages and writes floor(PREV/8) + 128. The CPU
            rebuilds the exact 11-bit sum. 2 draws per 8 columns.
+  blend    (BlendMatrix) 16 columns/pass like clamp8, but every pass blends
+           into the same pixels, so the framebuffer does the cross-pass sum
+           and the CPU reads one byte per row. Coarse, so it's for the
+           classifier, with the CPU recomputing the top candidates exactly.
 """
 import os
 import sys
@@ -126,13 +130,94 @@ class TevMatrix:
         return y
 
 
+# The blended classifier's settings in source/gx_matmul.c, and how many candidates the CPU recomputes
+# exactly (LlmModel.rescore_k). tools/tev_sim/blend_sweep.py picked them: with these, the app's sampler
+# (temperature 0.8, top-p 0.9) matches fp32's as closely as the old 18-bytes-per-row classifier did.
+BLEND = {"headroom": 0.25, "a0": 32, "c0": 32}
+RESCORE_K = 256
+
+
+class BlendMatrix:
+    """
+    Every pass blended into the same framebuffer pixels, so the CPU reads back
+    one byte per row instead of one per row per pass.
+
+    Blending saturates at 8 bits and the TEV can't write a negative number, so
+    passes alternate. Pass 0 draws without blending and writes a0 + c0 + P
+    (stage 0's d is C0 = a0 + c0). Odd passes flip every stage's sign and
+    blend with SUBTRACT (dst - src), writing c0 - P. Even passes write c0 + P
+    and blend with ADD. The c0's cancel in pairs, so the framebuffer ends at
+    a0 + sum(P), plus c0 if the pass count is odd, as long as nothing
+    saturates on the way.
+
+    Summing across passes in integers needs one scale for each row and one
+    for x: the weights are requantized per row (from the CPU's per-group
+    int8), and x gets a single scale for all columns, with a small headroom so
+    whole-row sums fit in the byte.
+    """
+
+    cols = 16
+
+    def __init__(self, w_f32, headroom=BLEND["headroom"], a0=BLEND["a0"], c0=BLEND["c0"], group_size=32):
+        rows, n = w_f32.shape
+        assert n % self.cols == 0
+        self.n, self.headroom, self.a0, self.c0 = n, headroom, a0, c0
+        q, s, _ = quantize_q8(w_f32, group_size)
+        w_cpu = q.astype(np.float32).reshape(rows, -1, group_size) * s.reshape(rows, -1, 1)  # what the CPU has
+        qr, sr, _ = quantize_q8(w_cpu.reshape(rows, n), n)
+        self.s = sr  # (rows,)
+        self.wu = (qr.reshape(rows, n).astype(np.int32) + 128).reshape(rows, -1, self.cols)
+        self.passes = n // self.cols
+        self.stats = {"calls": 0, "partials": 0, "saturated": 0}
+
+    def tev_sums(self, x):
+        """The framebuffer's whole-row sums S (rows,), and the x scale."""
+        xs = np.asarray(x, np.float32).reshape(1, self.n)
+        c, _, xscale = quantize_x(xs, self.headroom)
+        c, xs = c.reshape(self.passes, self.cols), xs.reshape(self.passes, self.cols)
+        rows = self.wu.shape[0]
+        last = self.cols - 1
+        acc = None
+        for p in range(self.passes):
+            odd = p % 2 == 1
+            neg = (xs[p] < 0) != odd
+            v = np.full(rows, self.a0 + self.c0 if p == 0 else self.c0, np.int32)  # stage 0's d: C0
+            for k in range(self.cols):
+                v = color_stage(HALF, self.wu[:, p, k], c[p, k], v, OP_SUB if neg[k] else OP_ADD,
+                                BIAS_ADDHALF if neg[k] else BIAS_SUBHALF, SCALE_1, clamp=k == last)
+            out = to_efb(v)
+            if p == 0:
+                acc = out
+            elif odd:
+                acc = np.maximum(acc - out, 0)  # GX_BM_SUBTRACT
+            else:
+                acc = np.minimum(acc + out, 255)  # GX_BM_BLEND, ONE * src + ONE * dst
+        self.last_acc = acc  # the framebuffer bytes, for check_probe.py
+        S = acc - self.a0 - (self.c0 if self.passes % 2 else 0)
+        self.stats["calls"] += 1
+        self.stats["partials"] += rows
+        self.stats["saturated"] += int(((acc == 0) | (acc == 255)).sum())
+        return S, xscale[0]
+
+    def tev_partials(self, x):
+        """Same interface as TevMatrix's, for the selftest hash: one 'pass' holding the whole-row sum."""
+        S, xscale = self.tev_sums(x)
+        return S.reshape(-1, 1), np.array([xscale])
+
+    def __call__(self, x):
+        S, xscale = self.tev_sums(x)
+        return (self.s * xscale) * S.astype(np.float32)  # gx_matmul.c's order
+
+
 class GPU:
     """Every weight matmul on the TEV (attention, norms and SiLU stay on the CPU)."""
 
-    def __init__(self, W, mode="clamp8", headroom=1.0, cols=None, rescore_k=0):
-        self.mats = {k: TevMatrix(m, mode, headroom, cols) for k, m in W.f32.items() if k != "emb"}
-        cols = self.mats["cls"].cols
-        self.label = f"GPU only ({mode}/{cols} cols, headroom {headroom})" + (f" + CPU top-{rescore_k}" if rescore_k else "")
+    def __init__(self, W, mode="clamp8", headroom=1.0, cols=None, rescore_k=0, blend_cls=False):
+        self.mats = {k: TevMatrix(m, mode, headroom, cols) for k, m in W.f32.items() if k not in ("emb", "cls")}
+        self.mats["cls"] = BlendMatrix(W.f32["cls"]) if blend_cls else TevMatrix(W.f32["cls"], mode, headroom, cols)
+        cols = self.mats[("w1", 0)].cols
+        self.label = (f"GPU only ({mode}/{cols} cols, headroom {headroom})" + (", blended classifier" if blend_cls else "")
+                      + (f" + CPU top-{rescore_k}" if rescore_k else ""))
         self.rescore_k = rescore_k
         self.cls_q8 = W.dequant("cls") if rescore_k else None
 
@@ -157,7 +242,10 @@ class Split:
 
     def __init__(self, W, mode="clamp8", headroom=1.0, cols=None, k=64):
         self.q8 = {n: W.dequant(n) for n in W.q8}
-        self.cls = TevMatrix(W.f32["cls"], mode, headroom, cols)
+        if mode == "blend":
+            self.cls = BlendMatrix(W.f32["cls"], headroom)
+        else:
+            self.cls = TevMatrix(W.f32["cls"], mode, headroom, cols)
         self.label = f"split ({mode}/{self.cls.cols} cols, headroom {headroom}, CPU top-{k})"
         self.k = k
 

@@ -24,13 +24,15 @@ void gxm_set_mode(int out_mode, float headroom);
 // LlmMatrix.gpu, or NULL if it's unsupported or memory ran out (llm_error() says which).
 void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols);
 // Uploads the classifier, then (if `layers`) every layer matrix. Sets m->gpu_matmul.
-// Returns 0 if everything asked for was uploaded.
+// Returns 0 if everything asked for was uploaded. The classifier is uploaded blended: one weight scale
+// per row and every pass summed in the framebuffer, so its logits are coarse (8 bits per row) and
+// meant for LlmModel.rescore_k. gxm_set_mode doesn't apply to it.
 int gxm_upload_model(LlmModel *m, int layers, size_t *bytes);
 
 void gxm_matmul(void *gpu, float *xout, const float *x); // an LlmGpuMatmulFn
 
 // Bit-exactness check against tools/tev_sim: FNV-1a over every pass's integer sum
-// (row-major, int16 little-endian) for input x.
+// (row-major, int16 little-endian) for input x. For the blended classifier, each row's whole sum.
 uint32_t gxm_partials_hash(void *gpu, const float *x);
 
 // For gx_probe.c: the latest framebuffer copy (RGBA8 tiles, w x h pixels), and a way to say

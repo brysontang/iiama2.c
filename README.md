@@ -10,7 +10,7 @@ The Wii does technically have a GPU. Hollywood is fixed-function, with no shader
 
 <sub>The first run on real hardware: stories15M on the CPU engine, on a TV through an HDMI adapter. The GPU engines told garbage stories on that run (the self-test hashes on screen are wrong); see [Dolphin vs a real Wii](#dolphin-vs-a-real-wii) for why.</sub>
 
-**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 20.5 tok/s with stories15M, 2.8x the CPU alone. See [Speed](#speed-on-a-real-wii).
+**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 30 tok/s with stories15M, 4x the CPU alone. See [Speed](#speed-on-a-real-wii).
 
 ## Quick start
 
@@ -72,17 +72,18 @@ Each TEV stage computes `d ± lerp(a, b, c)` on 8-bit inputs, with an 11-bit sig
 - **Activations** go in the four konst colors, one byte per stage. Every row multiplies the same `x`, so it never needs to be a texture.
 - **Stage k** is `lerp(HALF, TEXC, KONST)` with a bias that cancels the HALF, so it adds exactly `±round(q * x_k / 256)` to the running sum. Sixteen stages make a 16-column pass per draw. Stage 0 starts the sum from a constant rather than from the PREV register, because a real Wii doesn't reset PREV between pixels.
 - **The CPU** copies the framebuffer back and adds up the passes in float, applying the weight and activation scales.
+- **The output layer** lets the framebuffer do that sum instead. Every pass draws into the same pixels and the blend unit adds it in, so the CPU reads one byte per row instead of one per pass. Blending can only add or subtract 8-bit pixels, clamped to 0..255, so the passes alternate: even passes add `c + P`, odd passes flip every stage's sign and subtract `c - P`, and the constant offsets `c` cancel in pairs. That takes one weight scale per row and one activation scale per token, and an 8-bit total is coarse, so the CPU recomputes the top 256 rows exactly.
 
 The catch is getting an 11-bit sum out through 8-bit pixels. There are two output modes, and the engine switch picks between them:
 
 | Engine | What runs where |
 |---|---|
 | CPU | Everything on the CPU, int8 weights |
-| split | Transformer layers on the CPU. The GPU computes rough logits for the whole vocab, and the CPU recomputes the top 64 exactly. |
+| split | Transformer layers on the CPU. The GPU computes rough logits for the whole vocab (blended), and the CPU recomputes the top 256 exactly. |
 | GPU, fast | Every weight matmul on the TEV. `clamp8`: 16 columns per draw, partial sums saturate past ±128. |
 | GPU, exact | `exact11`: 8 columns per draw, plus a second draw that writes the high bits, so sums are exact. About 2.4x the GPU work. |
 
-Attention, norms and SiLU stay on the CPU in every engine.
+Both GPU engines run the output layer like split does. Attention, norms and SiLU stay on the CPU in every engine.
 
 ### Accuracy
 
@@ -92,33 +93,33 @@ stories15M, 1,154 positions of fp32-sampled stories replayed through each engine
 |---|---|---|---|
 | fp32 CPU | 100% | 0 | 2.77 |
 | int8 CPU | 98.4% | 0.0005 | 2.77 |
-| split | 98.4% | 0.0008 | 2.77 |
-| GPU, fast | 87.3% | 0.061 | 2.97 |
-| GPU, exact | 96.9% | 0.0022 | 2.77 |
+| split | 98.4% | 0.0046 | 2.78 |
+| GPU, fast | 90.6% | 0.040 | 2.88 |
+| GPU, exact | 97.1% | 0.0057 | 2.78 |
 
-The split engine matches int8 CPU on top-1 and perplexity: the true best token was inside the GPU's top 64 at all 1,154 positions. GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical.
+The split engine matches int8 CPU on top-1 and tells the same greedy stories: the true best token was inside the blended output layer's top 64 at all 1,154 positions. KL is higher than int8's because tokens outside the top 256 keep their coarse logits. At the app's sampling settings (temperature 0.8, top-p 0.9), the sampling distribution sits nearly as close to fp32's as int8 CPU's does (total variation 0.010 vs 0.009, `tools/tev_sim/blend_sweep.py`). GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical.
 
 ### Speed on a real Wii
 
 stories15M, int8, the bench's 64-token greedy story (see [below](#running-it-on-a-real-wii)):
 
-| Engine | tok/s | vs CPU |
+| Engine | tok/s | vs CPU | before blending |
+|---|---|---|---|
+| CPU | 7.41 | 1x | 7.41 |
+| split | 15.34 | 2.1x | 12.29 |
+| GPU, fast | 30.01 | 4.0x | 20.55 |
+| GPU, exact | 17.36 | 2.3x | 9.46 |
+
+Where a GPU-fast token's 33 ms goes (49 ms before blending):
+
+| | ms | before |
 |---|---|---|
-| CPU | 7.41 | 1x |
-| split | 12.29 | 1.7x |
-| GPU, fast | 20.55 | 2.8x |
-| GPU, exact | 9.46 | 1.3x |
+| CPU issuing GX commands | 4.7 | 4.6 |
+| CPU waiting for the GPU (6.4 of it the output layer) | 9.6 | 9.9 |
+| CPU reading the framebuffer back and summing passes | 12.9 | 29.0 |
+| Everything else (attention, norms, SiLU, recomputing the top 256) | 6.0 | 5.1 |
 
-Where a GPU-fast token's 49 ms goes:
-
-| | ms |
-|---|---|
-| CPU issuing GX commands | 4.6 |
-| CPU waiting for the GPU | 9.9 |
-| CPU reading the framebuffer back and summing passes | 29.0 |
-| Everything else (attention, norms, SiLU, sampling) | 5.1 |
-
-The GPU itself is the small part. The readback costs about 13 cycles per output row per pass, four times what its instructions suggest, most likely in cache misses: the framebuffer copy and the weight scales all stream in from main memory. `tools/cost_model.py` was fitted to these numbers and reproduces each engine within 3%, so it can price an idea before anyone writes it.
+The readback costs about 13 cycles per output row per pass, four times what its instructions suggest, most likely in cache misses: the framebuffer copy and the weight scales all stream in from main memory. Blending took the output layer's 18 passes down to one, and what's left is the transformer layers. `tools/cost_model.py` was fitted to the numbers from before blending, reproducing each engine within 3%, and then predicted all three blended speedups within 4% before the code was written.
 
 ## Running it on a real Wii
 
@@ -182,7 +183,7 @@ Four cautions:
 
 ### Dolphin vs a real Wii
 
-The first build matched the simulator bit for bit in Dolphin and told garbage stories on a real Wii. The probes found why: **Dolphin starts every pixel's TEV registers from the values set with `GX_SetTevColor`, but a real Wii doesn't reset PREV between pixels.** As far as the probes can tell, each pixel's PREV starts with whatever an earlier pixel left there, so the matmul's starting sum of 128 (or 0) was leftover garbage, and repeated runs of the same matmul gave different results. Everything else the probes test matched Dolphin exactly. The fix is to never read PREV before writing it: stage 0 takes its starting value from a constant input (`GX_CC_HALF` or `GX_CC_ZERO`) instead.
+The first build matched the simulator bit for bit in Dolphin and told garbage stories on a real Wii. The probes found why: **Dolphin starts every pixel's TEV registers from the values set with `GX_SetTevColor`, but a real Wii doesn't reset PREV between pixels.** As far as the probes can tell, each pixel's PREV starts with whatever an earlier pixel left there, so the matmul's starting sum of 128 (or 0) was leftover garbage, and repeated runs of the same matmul gave different results. Everything else the probes test matched Dolphin exactly. The fix is to never read PREV before writing it: stage 0 takes its starting value from a constant input (`GX_CC_HALF`, `GX_CC_ZERO`, or the C0 register for the blended passes) instead.
 
 ## How it was checked
 
@@ -194,8 +195,8 @@ Output was compared token for token, with greedy decoding and seeded sampling, a
 The GPU path was checked in layers:
 
 - **The TEV math.** `tools/tev_sim/tev.py` follows the combiner arithmetic in Dolphin's software renderer (`Tev.cpp`). The probes confirmed it on a real Wii: one multiply-add stage for all 256 weight bytes against 10 activation values in both signs, the halving stages, and out-of-range writes, which wrap like a u8 cast.
-- **The simulator against Dolphin.** Run in Dolphin, the Wii build's integer pass sums match the simulator bit for bit, for three matrix shapes in both output modes. Over 64 greedy tokens, four of the five engines tell the same story as the simulator. GPU-fast diverges at token 41, at a near-tie (the top two logits differ by 0.02, against a median gap of 1.9), where the CPU-side float rounding of numpy and C differs.
-- **The simulator against a real Wii.** The same six integer hashes, identical across repeated runs. Over 64 greedy tokens, the Wii's stories match the simulator's exactly for four of the five engines, and GPU-fast diverges at the same token-41 near-tie as in Dolphin.
+- **The simulator against Dolphin.** Run in Dolphin, the Wii build's integer outputs match the simulator bit for bit: the pass sums for two matrix shapes in both output modes, and the blended output layer's framebuffer. Over 64 greedy tokens, three of the four engines tell the same story as the simulator. GPU-fast diverges at token 52, where the top two logits differ by 0.2 (median gap 2.1): it requantizes activations to 8 bits at every layer, which turns the small differences between numpy's and C's float rounding into different integer inputs.
+- **The simulator against a real Wii.** The same integer hashes and probe images, bit for bit, blending included. The Wii's text output is identical to Dolphin's, GPU-fast divergence and all.
 - **The simulator against the C engine.** The numpy port in `tools/tev_sim/llama.py` reproduces the C engine's greedy stories exactly, fp32 and int8.
 
 Note that the default build sums each matmul row with 4 accumulators for speed, so its fp32 output can differ from upstream in the last bits. Build with `-DLLM_EXACT_MATMUL` if you want upstream-exact numerics.
@@ -220,10 +221,11 @@ Note that the default build sums each matmul row with 4 accumulators for speed, 
 
 ## Ideas for next steps
 
-- **Overlap the CPU and GPU.** Right now the CPU waits for each batch of draws and then sums it. Double-buffering the framebuffer copy would let the CPU sum batch k while the GPU draws batch k+1. Splitting a matmul's rows between the two would put both to work.
-- **Shrink the readback.** It's 60% of a GPU-fast token. The most promising fix is to let the framebuffer do the summing: blend every pass into the same pixels, alternating add and subtract blend modes so the 128 biases cancel, and read back one byte per row instead of one per pass. That needs per-row weight scales and one activation scale per token. In the simulator the blended classifier still had the true best token in its top 64 at all 240 positions tested, and the fitted cost model says it takes split from 12.3 to ~15.6 tok/s and GPU-fast (with a CPU top-64 rescore) from 20.4 to ~31.
+- **Overlap the CPU and GPU.** Right now the CPU waits for each matmul and then sums it. Some matmuls don't depend on each other (q, k and v; the two halves of the FFN), so the CPU could sum one while the GPU draws the next.
+- **Shrink the layers' readback.** It's still 40% of a GPU-fast token. Blending pairs of passes that share a weight scale group, with one activation scale per pair, would halve it without per-row scales, at the cost of more saturation.
 - **Cheaper GX calls.** libogc's TEV setters do read-modify-write on shadow state; about 3,600 instructions per pass could be a few hundred as raw register writes.
-- **Paired-singles dequantization.** Broadway's `psq_l` instruction loads two int8 values and converts them to floats in hardware, scaled by a GQR register. Nintendo built it for vertex compression, and it's a near-perfect fit for int8 weights. Swapping the lookup table in `matmul_q8` for `psq_l` + `ps_madd` would cut the CPU engine's loads by more than half. Adding `dcbt` prefetches would hide some of the memory stalls.
+- **Paired-singles dequantization.** Broadway's `psq_l` instruction loads two int8 values and converts them to floats in hardware, scaled by a GQR register. Nintendo built it for vertex compression, and it's a near-perfect fit for int8 weights. Swapping the lookup table in `matmul_q8` for `psq_l` + `ps_madd` would cut the CPU engine's loads by more than half.
+- **Stream weights with the locked cache.** A plain read loop gets about 400 MB/s, one cache miss at a time, and `dcbt` prefetching doesn't help on a real Wii (the probe measured it). Broadway can lock half its L1 as scratchpad and DMA into it from main memory in the background, which is how GameCube games streamed data; double-buffering the CPU matmul's weights through it could hide the memory stalls.
 - **Train your own.** A ~15M model trained on a narrow domain (a grumpy turtle king, say) on a single gaming GPU is more coherent and much funnier than a general one. Use a small vocab while you're at it: on stories15M, the 32000-token output layer is ~60% of the work per token, and a 4096-token vocab (llama2.c's `--vocab_source=custom`) roughly halves it. Export with llama2.c's `export.py --version 0`, then run it through `export_wii.py`.
 
 ## Credits

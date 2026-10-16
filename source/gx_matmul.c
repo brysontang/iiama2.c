@@ -10,6 +10,8 @@
 //   * stage k: PREV += +/- round(q * x_k / 256), computed as
 //     lerp(HALF, TEXC, KONST) with the stage bias cancelling the HALF
 //   * the CPU copies the framebuffer back and sums the passes in float
+// The classifier is different: its passes all blend into the same pixels, so the
+// framebuffer does the summing and the CPU reads one byte per row (run_blend).
 
 #include "gx_matmul.h"
 
@@ -27,6 +29,13 @@
 #define PLANES 8        // input columns per texture, side by side
 #define PLANE_W_MAX 128 // so a texture is at most 8 * 128 = 1024 texels wide
 #define MAX_PASSES 128  // up to 1024 input columns
+#define LAYOUT_BLEND 2  // load_layout()'s third setup, next to GXM_CLAMP8 and GXM_EXACT11
+
+// The blended classifier: x's headroom, the framebuffer's starting value, and the TEV's offset per pass.
+// Must match BLEND in tools/tev_sim/gxmatmul.py.
+#define BLEND_HEADROOM 0.25f
+#define BLEND_A0 32
+#define BLEND_C0 32
 
 typedef struct {
     int rows, cols, gs;
@@ -37,6 +46,8 @@ typedef struct {
     uint8_t *tex;
     GXTexObj *obj;
     float *st;          // weight scales transposed to (cols / gs, 3 * npx) so the readback streams them
+    int blend;          // a blended matrix: weights requantized per row, all passes summed in the framebuffer
+    float *srow;        // its per-row scales (3 * npx, zero past the last row)
 } GxMat;
 
 static int g_ready;
@@ -49,7 +60,7 @@ static int16_t *g_partials;    // only while hashing
 static int g_last_cw, g_last_ch; // size of the latest framebuffer copy (gx_probe.c reads it)
 static size_t g_bytes;
 // framebuffer byte -> pass sum, without PowerPC's slow int-to-float conversion
-static float g_lut_c8[256], g_lut_hi[256], g_lut_lo[256];
+static float g_lut_c8[256], g_lut_hi[256], g_lut_lo[256], g_lut_bl[2][256];
 static GxmStats g_stats;
 
 int gxm_init(void) {
@@ -63,6 +74,8 @@ int gxm_init(void) {
         g_lut_c8[b] = (float)(b - 128);
         g_lut_hi[b] = (float)(8 * (b - 128));
         g_lut_lo[b] = (float)(b & 7);
+        g_lut_bl[0][b] = (float)(b - BLEND_A0); // even pass count
+        g_lut_bl[1][b] = (float)(b - BLEND_A0 - BLEND_C0);
     }
 
     GXColor black = {0, 0, 0, 0};
@@ -120,13 +133,14 @@ void gxm_set_mode(int out_mode, float headroom) {
 // The parts of the TEV setup that don't change from pass to pass.
 static void load_layout(int mode) {
     if (g_layout == mode) return;
-    int product = mode == GXM_CLAMP8 ? 16 : 8;
+    int product = mode == GXM_EXACT11 ? 8 : 16;
     for (int k = 0; k < product; k++) {
         u8 st = GX_TEVSTAGE0 + k;
         GX_SetTevOrder(st, GX_TEXCOORD0 + (k & 7), GX_TEXMAP0 + (k >> 3), GX_COLORNULL);
         // Stage 0 starts the sum from a constant: real hardware doesn't reset PREV for each pixel
         // (it holds whatever an earlier pixel left there), so no stage may read PREV before writing it.
-        u8 d = k > 0 ? GX_CC_CPREV : mode == GXM_CLAMP8 ? GX_CC_HALF : GX_CC_ZERO;
+        // The blended classifier's start changes between passes, so it comes from C0.
+        u8 d = k > 0 ? GX_CC_CPREV : mode == GXM_CLAMP8 ? GX_CC_HALF : mode == LAYOUT_BLEND ? GX_CC_C0 : GX_CC_ZERO;
         GX_SetTevColorIn(st, GX_CC_HALF, GX_CC_TEXC, GX_CC_KONST, d);
         GX_SetTevKColorSel(st, GX_TEV_KCSEL_K0_R + 4 * (k & 3) + (k >> 2)); // x_k = kcolor[k/4].rgba[k%4]
         GX_SetTevAlphaIn(st, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO);
@@ -150,11 +164,20 @@ static void load_layout(int mode) {
     g_layout = mode;
 }
 
-static uint8_t wu(const LlmMatrix *w, int rows, int cols, int row, int col) {
-    return row < rows ? (uint8_t)(w->q[(size_t)row * cols + col] + 128) : 128;
+// Texture byte for (row, col): the CPU's int8 weight + 128, or for a blended matrix, the weight
+// requantized with one scale per row. Must match BlendMatrix in tools/tev_sim/gxmatmul.py exactly.
+static uint8_t wu(const GxMat *g, const LlmMatrix *w, int row, int col) {
+    if (row >= g->rows) return 128;
+    size_t i = (size_t)row * g->cols + col;
+    if (!g->blend) return (uint8_t)(w->q[i] + 128);
+    float v = (float)w->q[i] * w->s[i / g->gs];
+    float s = g->srow[row] == 0.0f ? 1.0f : g->srow[row];
+    int q = (int)rintf(v / s);
+    q = q > 127 ? 127 : q < -127 ? -127 : q;
+    return (uint8_t)(q + 128);
 }
 
-void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
+static void *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, int blend) {
     if (m->dtype != LLM_DTYPE_Q8 || m->gs % 16 || cols % 16 || cols / 8 > MAX_PASSES) {
         llm_set_error("the GPU path needs int8 weights with a group size that's a multiple of 16");
         return NULL;
@@ -164,6 +187,7 @@ void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
     g->rows = rows;
     g->cols = cols;
     g->gs = m->gs;
+    g->blend = blend;
     g->npx = (rows + 2) / 3;
     // smallest region (both sides multiples of 4, the RGBA8 tile size) that holds npx pixels
     g->pw = g->ph = 0;
@@ -182,18 +206,33 @@ void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
     int groups = cols / g->gs, padded_rows = 3 * g->npx;
     g->tex = (uint8_t *)memalign(32, (size_t)g->tex_bytes * g->ntex);
     g->obj = (GXTexObj *)malloc(sizeof(GXTexObj) * g->ntex);
-    g->st = (float *)calloc((size_t)groups * padded_rows, sizeof(float));
-    if (!g->tex || !g->obj || !g->st) {
+    size_t nscales = blend ? (size_t)padded_rows : (size_t)groups * padded_rows;
+    float *scales = (float *)calloc(nscales, sizeof(float));
+    if (blend) g->srow = scales;
+    else g->st = scales;
+    if (!g->tex || !g->obj || !scales) {
         llm_set_error("out of memory for GPU textures (%lu KB, %lu KB already uploaded)",
                       (unsigned long)((size_t)g->tex_bytes * g->ntex / 1024), (unsigned long)(g_bytes / 1024));
         free(g->tex);
         free(g->obj);
-        free(g->st);
+        free(scales);
         free(g);
         return NULL;
     }
-    for (int r = 0; r < rows; r++)
-        for (int k = 0; k < groups; k++) g->st[(size_t)k * padded_rows + r] = w->s[(size_t)r * groups + k];
+    if (blend) {
+        for (int r = 0; r < rows; r++) {
+            float amax = 0.0f;
+            for (int c = 0; c < cols; c++) {
+                size_t i = (size_t)r * cols + c;
+                float v = fabsf((float)w->q[i] * w->s[i / g->gs]);
+                if (v > amax) amax = v;
+            }
+            g->srow[r] = amax / 127.0f;
+        }
+    } else {
+        for (int r = 0; r < rows; r++)
+            for (int k = 0; k < groups; k++) g->st[(size_t)k * padded_rows + r] = w->s[(size_t)r * groups + k];
+    }
 
     // RGBA8 textures are 4x4 tiles of 64 bytes: 16 AR pairs, then 16 GB pairs
     for (int t = 0; t < g->ntex; t++) {
@@ -206,9 +245,9 @@ void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
                     uint8_t *tile = base + ((((py >> 2) * (tw >> 2)) + (tx >> 2)) << 6);
                     int i = ((py & 3) << 2) | (tx & 3);
                     tile[2 * i] = 0;
-                    tile[2 * i + 1] = wu(w, rows, cols, row, col);
-                    tile[32 + 2 * i] = wu(w, rows, cols, row + 1, col);
-                    tile[32 + 2 * i + 1] = wu(w, rows, cols, row + 2, col);
+                    tile[2 * i + 1] = wu(g, w, row, col);
+                    tile[32 + 2 * i] = wu(g, w, row + 1, col);
+                    tile[32 + 2 * i + 1] = wu(g, w, row + 2, col);
                 }
             }
         }
@@ -217,16 +256,18 @@ void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
         GX_InitTexObjFilterMode(&g->obj[t], GX_NEAR, GX_NEAR);
     }
     GX_InvalidateTexAll();
-    g_bytes += (size_t)g->tex_bytes * g->ntex + (size_t)groups * padded_rows * sizeof(float);
+    g_bytes += (size_t)g->tex_bytes * g->ntex + nscales * sizeof(float);
     return g;
 }
+
+void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) { return upload(m, w, rows, cols, 0); }
 
 int gxm_upload_model(LlmModel *m, int layers, size_t *bytes) {
     LlmConfig *c = &m->c;
     int dim = c->dim, hid = c->hidden_dim, kv = c->dim * c->n_kv_heads / c->n_heads;
     m->gpu_matmul = gxm_matmul;
     int rc = 0;
-    if (!m->cls.gpu && !(m->cls.gpu = gxm_upload(m, &m->cls, c->vocab_size, dim))) rc = -1;
+    if (!m->cls.gpu && !(m->cls.gpu = upload(m, &m->cls, c->vocab_size, dim, 1))) rc = -1;
     for (int l = 0; rc == 0 && layers && l < c->n_layers; l++) {
         LlmLayer *L = &m->layers[l];
         struct { LlmMatrix *w; int rows, cols; } mats[7] = {
@@ -239,22 +280,22 @@ int gxm_upload_model(LlmModel *m, int layers, size_t *bytes) {
     return rc;
 }
 
-// Per-pass activation quantization. Must match quantize_x in gxmatmul.py exactly.
-static void quantize_pass(const float *x, int base, int pc, uint8_t *kb, uint8_t *neg, float *xscale) {
+// Activation quantization for n columns with one scale. Must match quantize_x in gxmatmul.py exactly.
+static void quantize(const float *x, int n, float headroom, uint8_t *kb, uint8_t *neg, float *xscale) {
     float xmax = 0.0f;
-    for (int k = 0; k < pc; k++)
-        if (fabsf(x[base + k]) > xmax) xmax = fabsf(x[base + k]);
+    for (int k = 0; k < n; k++)
+        if (fabsf(x[k]) > xmax) xmax = fabsf(x[k]);
     if (xmax == 0.0f) xmax = 1.0f;
-    for (int k = 0; k < pc; k++) {
-        float v = x[base + k];
-        float t = fabsf(v) / xmax * (256.0f * g_headroom);
+    for (int k = 0; k < n; k++) {
+        float v = x[k];
+        float t = fabsf(v) / xmax * (256.0f * headroom);
         int cp = (int)rintf(t);
         if (cp > 256) cp = 256;
         if (cp == 128) cp = t >= 128.0f ? 129 : 127; // c' = c + (c >> 7) never equals 128
         kb[k] = (uint8_t)(cp - (cp >= 129));
         neg[k] = v < 0.0f;
     }
-    *xscale = xmax / g_headroom;
+    *xscale = xmax / headroom;
 }
 
 static void draw_quad(int x0, int y0, int w, int h) {
@@ -346,7 +387,80 @@ static void collect_partials(const GxMat *g, int p0, int np, int passes, int dra
     }
 }
 
+// The blended classifier (BlendMatrix in tools/tev_sim/gxmatmul.py has the details). Every pass draws
+// over the same pixels: pass 0 replaces them with A0 + C0 + sum, odd passes flip every stage's sign and
+// subtract (C0 - sum), even passes add (C0 + sum). The C0s cancel in pairs, so the framebuffer ends
+// with A0 + the whole row's sum, and the CPU reads one byte per row.
+static void run_blend(GxMat *g, float *xout, const float *x) {
+    static uint8_t kb[MAX_PASSES * PLANES], neg[MAX_PASSES * PLANES];
+    int passes = g->cols / 16, base = BLEND_A0 + (passes & 1 ? BLEND_C0 : 0);
+    const float *lut = g_lut_bl[passes & 1];
+    float xscale;
+    uint64_t ta = gettime();
+    load_layout(LAYOUT_BLEND);
+    quantize(x, g->cols, BLEND_HEADROOM, kb, neg, &xscale);
+    GX_SetNumTevStages(16);
+    for (int p = 0; p < passes; p++) {
+        const uint8_t *kp = kb + 16 * p, *np = neg + 16 * p;
+        int odd = p & 1;
+        for (int kc = 0; kc < 4; kc++) {
+            GXColor col = {kp[4 * kc], kp[4 * kc + 1], kp[4 * kc + 2], kp[4 * kc + 3]};
+            GX_SetTevKColor(GX_KCOLOR0 + kc, col);
+        }
+        for (int k = 0; k < 16; k++) {
+            int n = np[k] ^ odd;
+            GX_SetTevColorOp(GX_TEVSTAGE0 + k, n ? GX_TEV_SUB : GX_TEV_ADD, n ? GX_TB_ADDHALF : GX_TB_SUBHALF,
+                             GX_CS_SCALE_1, k == 15, GX_TEVPREV);
+        }
+        if (p < 2) {
+            s16 c = p == 0 ? BLEND_A0 + BLEND_C0 : BLEND_C0;
+            GXColorS10 c0 = {c, c, c, c};
+            GX_SetTevColorS10(GX_TEVREG0, c0);
+        }
+        GX_SetBlendMode(p == 0 ? GX_BM_NONE : odd ? GX_BM_SUBTRACT : GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
+        GX_LoadTexObj(&g->obj[2 * p], GX_TEXMAP0);
+        GX_LoadTexObj(&g->obj[2 * p + 1], GX_TEXMAP1);
+        draw_quad(0, 0, g->pw, g->ph);
+    }
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    GX_SetTexCopySrc(0, 0, g->pw, g->ph);
+    GX_SetTexCopyDst(g->pw, g->ph, GX_TF_RGBA8, GX_FALSE);
+    GX_CopyTex(g_readbuf, GX_FALSE);
+    uint64_t tb = gettime();
+    GX_DrawDone();
+    uint64_t tc = gettime();
+    DCInvalidateRange(g_readbuf, g->pw * g->ph * 4);
+    g_last_cw = g->pw;
+    g_last_ch = g->ph;
+
+    for (int ty = 0; ty < g->ph / 4; ty++) {
+        for (int tx = 0; tx < g->pw / 4; tx++) {
+            const uint8_t *t = g_readbuf + ((size_t)ty * (g->pw / 4) + tx) * 64;
+            for (int i = 0; i < 16; i++) {
+                int pix = (ty * 4 + (i >> 2)) * g->pw + tx * 4 + (i & 3);
+                if (pix >= g->npx) continue;
+                int row = 3 * pix, n = g->rows - row < 3 ? g->rows - row : 3;
+                uint8_t b[3] = {t[2 * i + 1], t[32 + 2 * i], t[33 + 2 * i]};
+                for (int c = 0; c < n; c++) {
+                    if (xout) xout[row + c] = (g->srow[row + c] * xscale) * lut[b[c]];
+                    if (g_partials) g_partials[row + c] = (int16_t)(b[c] - base);
+                }
+            }
+        }
+    }
+    uint64_t td = gettime();
+    g_stats.draw_ticks += tb - ta;
+    g_stats.wait_ticks += tc - tb;
+    g_stats.reduce_ticks += td - tc;
+    g_stats.draws += passes;
+    g_stats.matmuls++;
+}
+
 static void run(GxMat *g, float *xout, const float *x) {
+    if (g->blend) {
+        run_blend(g, xout, x);
+        return;
+    }
     int clamp8 = g_mode == GXM_CLAMP8;
     int pc = clamp8 ? 16 : 8, draws = clamp8 ? 1 : 2;
     int passes = g->cols / pc, tex_per_pass = pc / PLANES;
@@ -362,7 +476,7 @@ static void run(GxMat *g, float *xout, const float *x) {
         uint64_t ta = gettime();
         for (int i = 0; i < np; i++) {
             int p = p0 + i;
-            quantize_pass(x, p * pc, pc, kb, neg, &g_xscale[p]);
+            quantize(x + p * pc, pc, g_headroom, kb, neg, &g_xscale[p]);
             for (int kc = 0; kc < pc / 4; kc++) {
                 GXColor col = {kb[4 * kc], kb[4 * kc + 1], kb[4 * kc + 2], kb[4 * kc + 3]};
                 GX_SetTevKColor(GX_KCOLOR0 + kc, col);
@@ -410,7 +524,7 @@ void gxm_matmul(void *gpu, float *xout, const float *x) { run((GxMat *)gpu, xout
 
 uint32_t gxm_partials_hash(void *gpu, const float *x) {
     GxMat *g = (GxMat *)gpu;
-    int passes = g->cols / (g_mode == GXM_CLAMP8 ? 16 : 8);
+    int passes = g->blend ? 1 : g->cols / (g_mode == GXM_CLAMP8 ? 16 : 8); // a blended matrix has one sum per row
     g_partials = (int16_t *)calloc((size_t)g->rows * passes, sizeof(int16_t));
     if (!g_partials) return 0;
     run(g, NULL, x);
