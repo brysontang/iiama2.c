@@ -242,6 +242,23 @@ done:
 }
 
 // ----------------------------------------------------------------------------
+// per-token profile (LlmModel.prof)
+//
+// Each part of a token ends with a lap, which charges it the time since the previous lap. One counter
+// read separates two parts, and the parts add up to the whole token.
+
+static void prof_start(LlmProfile *pf) {
+    if (pf) pf->last = pf->now();
+}
+
+static void prof_lap(LlmProfile *pf, int part) {
+    if (!pf) return;
+    uint32_t now = pf->now();
+    pf->ticks[part] += now - pf->last;
+    pf->last = now;
+}
+
+// ----------------------------------------------------------------------------
 // math
 //
 // Broadway (PowerPC 750CL) has no fast int->float instruction, so converting
@@ -450,7 +467,7 @@ static void sift_down(int *h, int k, const float *v, int i) {
 
 // The GPU's logits are coarse. Find its top K and recompute those exactly on
 // the CPU; the coarse values stand in for the long tail.
-static void rescore(LlmModel *m, const float *x) {
+static void rescore(LlmModel *m, const float *x, LlmProfile *pf) {
     int V = m->c.vocab_size, k = m->rescore_k, *h = m->topk;
     if (k > V) k = V;
     if (k > LLM_MAX_RESCORE) k = LLM_MAX_RESCORE;
@@ -459,7 +476,9 @@ static void rescore(LlmModel *m, const float *x) {
     for (int i = k / 2 - 1; i >= 0; i--) sift_down(h, k, v, i);
     for (int i = k; i < V; i++)
         if (v[i] > v[h[0]]) { h[0] = i; sift_down(h, k, v, 0); }
+    prof_lap(pf, LLM_PROF_TOPK);
     for (int i = 0; i < k; i++) m->logits[h[i]] = row_dot(m, &m->cls, h[i], x, m->c.dim);
+    prof_lap(pf, LLM_PROF_RECOMPUTE);
 }
 
 static void rmsnorm(float *o, const float *x, const float *weight, int size) {
@@ -492,6 +511,9 @@ float *llm_forward(LlmModel *m, int token, int pos) {
     int kv_mul = p->n_heads / p->n_kv_heads;
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
+    LlmProfile *pf = pos > 0 ? m->prof : NULL; // like gen_ms, the profile skips the first token
+    if (pf) pf->tokens++;
+    prof_start(pf);
 
     // token embedding -> x
     if (m->dtype == LLM_DTYPE_F32) {
@@ -501,6 +523,7 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         const float *rs = m->emb.s + (size_t)token * (dim / m->gs);
         for (int j = 0; j < dim; j++) x[j] = I8F(row[j]) * rs[j / m->gs];
     }
+    prof_lap(pf, LLM_PROF_EMBED);
 
     // RoPE's rotations depend only on the position and the dimension within a head, so they're computed
     // once per token instead of once per layer and head (the same operations, so the same floats)
@@ -510,12 +533,14 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         m->rope[i] = cosf(val);
         m->rope[i + 1] = sinf(val);
     }
+    prof_lap(pf, LLM_PROF_ROPE_TABLE);
 
     int kv8 = m->key_cache8 != NULL;
     for (int l = 0; l < p->n_layers; l++) {
         LlmLayer *w = &m->layers[l];
 
         rmsnorm(m->xb, x, m->rms_att + (size_t)l * dim, dim);
+        prof_lap(pf, LLM_PROF_RMSNORM);
 
         size_t loff = (size_t)l * p->seq_len * kv_dim;
         size_t soff = (size_t)l * p->seq_len * p->n_kv_heads;
@@ -525,6 +550,7 @@ float *llm_forward(LlmModel *m, int token, int pos) {
         matmul(m, m->q, m->xb, &w->wq, dim, dim);
         matmul(m, k, m->xb, &w->wk, dim, kv_dim);
         matmul(m, v, m->xb, &w->wv, dim, kv_dim);
+        prof_lap(pf, LLM_PROF_QKV);
 
         // RoPE
         for (int i = 0; i < dim; i += 2) {
@@ -540,7 +566,9 @@ float *llm_forward(LlmModel *m, int token, int pos) {
                 vec[i + 1] = v0 * fci + v1 * fcr;
             }
         }
+        prof_lap(pf, LLM_PROF_ROPE);
 
+        uint32_t att_start = pf ? pf->last : 0; // for the profile's attention by position
         if (kv8) {
             for (int kh = 0; kh < p->n_kv_heads; kh++) {
                 size_t at = loff + (size_t)pos * kv_dim + kh * head_size, st = soff + (size_t)pos * p->n_kv_heads + kh;
@@ -548,6 +576,7 @@ float *llm_forward(LlmModel *m, int token, int pos) {
                 quantize_kv(v + kh * head_size, head_size, m->value_cache8 + at, m->value_scale + st);
             }
         }
+        prof_lap(pf, LLM_PROF_KV_QUANT);
 
         // multihead attention
         for (int h = 0; h < p->n_heads; h++) {
@@ -568,7 +597,9 @@ float *llm_forward(LlmModel *m, int token, int pos) {
                 score /= sqrtf(head_size);
                 att[t] = score;
             }
+            prof_lap(pf, LLM_PROF_SCORES);
             softmax(att, pos + 1);
+            prof_lap(pf, LLM_PROF_SOFTMAX);
             float *xb = m->xb + h * head_size;
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
@@ -583,31 +614,43 @@ float *llm_forward(LlmModel *m, int token, int pos) {
                     for (int i = 0; i < head_size; i++) xb[i] += a * vv[i];
                 }
             }
+            prof_lap(pf, LLM_PROF_MIX);
         }
+        if (pf && pos < LLM_PROF_MAX_POS) pf->attention[pos] += pf->last - att_start;
 
         matmul(m, m->xb2, m->xb, &w->wo, dim, dim);
+        prof_lap(pf, LLM_PROF_WO);
         for (int i = 0; i < dim; i++) x[i] += m->xb2[i];
+        prof_lap(pf, LLM_PROF_RESIDUAL);
 
         // FFN: w2(silu(w1(x)) * w3(x))
         rmsnorm(m->xb, x, m->rms_ffn + (size_t)l * dim, dim);
+        prof_lap(pf, LLM_PROF_RMSNORM);
         matmul(m, m->hb, m->xb, &w->w1, dim, hidden_dim);
         matmul(m, m->hb2, m->xb, &w->w3, dim, hidden_dim);
+        prof_lap(pf, LLM_PROF_W1W3);
         for (int i = 0; i < hidden_dim; i++) {
             float val = m->hb[i];
             val *= (1.0f / (1.0f + expf(-val)));
             val *= m->hb2[i];
             m->hb[i] = val;
         }
+        prof_lap(pf, LLM_PROF_SILU);
         matmul(m, m->xb, m->hb, &w->w2, hidden_dim, dim);
+        prof_lap(pf, LLM_PROF_W2);
         for (int i = 0; i < dim; i++) x[i] += m->xb[i];
+        prof_lap(pf, LLM_PROF_RESIDUAL);
     }
 
     rmsnorm(x, x, m->rms_final, dim);
+    prof_lap(pf, LLM_PROF_RMSNORM);
     if (m->mode != LLM_MODE_CPU && m->cls.gpu) {
         m->gpu_matmul(m->cls.gpu, m->logits, x);
-        if (m->rescore_k > 0) rescore(m, x);
+        prof_lap(pf, LLM_PROF_CLS);
+        if (m->rescore_k > 0) rescore(m, x, pf);
     } else {
         matmul(m, m->logits, x, &m->cls, p->dim, p->vocab_size);
+        prof_lap(pf, LLM_PROF_CLS);
     }
     return m->logits;
 }
@@ -873,6 +916,7 @@ int llm_generate(LlmModel *m, LlmTokenizer *t, LlmSampler *s, const char *prompt
     while (pos < steps) {
         float *logits = llm_forward(m, token, pos);
         next = pos < n_prompt - 1 ? prompt_tokens[pos + 1] : llm_sample(s, logits);
+        prof_lap(pos > 0 ? m->prof : NULL, LLM_PROF_SAMPLE); // since llm_forward's last lap, at the logits
         pos++;
         if (next == 1) break; // BOS delimits sequences
         const char *piece = llm_decode(t, token, next);

@@ -10,6 +10,7 @@
 //     so the Wii can show the message instead of black-screening
 //   * a hook for running weight matmuls elsewhere (LlmModel.mode/gpu_matmul),
 //     which gx_matmul.c uses to put them on the GPU
+//   * an optional per-token profile (LlmModel.prof), for the bench
 #ifndef WII_LLM_H
 #define WII_LLM_H
 
@@ -28,6 +29,43 @@
 
 // xout = W @ x for a matrix uploaded to the GPU (LlmMatrix.gpu).
 typedef void (*LlmGpuMatmulFn)(void *gpu, float *xout, const float *x);
+
+// Where a token's time goes, for the bench (LlmModel.prof). The weight matmuls are timed as whole calls,
+// wherever they run; everything else is CPU work between them.
+enum {
+    LLM_PROF_EMBED,      // token embedding lookup
+    LLM_PROF_ROPE_TABLE, // this position's RoPE cos/sin pairs
+    LLM_PROF_RMSNORM,    // attention, FFN and final
+    LLM_PROF_QKV,        // matmuls
+    LLM_PROF_ROPE,       // rotating q and k
+    LLM_PROF_KV_QUANT,   // this position's k and v to int8 (int8 models)
+    LLM_PROF_SCORES,     // attention: q.k for every position so far
+    LLM_PROF_SOFTMAX,
+    LLM_PROF_MIX,        // attention: att * v
+    LLM_PROF_WO,         // matmul
+    LLM_PROF_RESIDUAL,   // x += attention and FFN outputs
+    LLM_PROF_W1W3,       // matmuls
+    LLM_PROF_SILU,       // silu(w1 x) * w3 x
+    LLM_PROF_W2,         // matmul
+    LLM_PROF_CLS,        // matmul (on the GPU: coarse logits for the whole vocab)
+    LLM_PROF_TOPK,       // rescoring: finding the GPU's top K
+    LLM_PROF_RECOMPUTE,  // rescoring: recomputing them on the CPU
+    LLM_PROF_SAMPLE,     // argmax or sampling (llm_generate)
+    LLM_PROF_N
+};
+#define LLM_PROF_MAX_POS 1024
+
+typedef uint32_t (*LlmTicksFn)(void); // a free-running counter (wraps at 2^32)
+
+// Ticks per part, summed over the tokens profiled. Like llm_generate's gen_ms, it skips the first
+// token: llm_forward only profiles positions after 0.
+typedef struct {
+    LlmTicksFn now;                       // set by the app (main.c: Broadway's time base)
+    uint64_t ticks[LLM_PROF_N];
+    uint32_t attention[LLM_PROF_MAX_POS]; // KV quantization through att * v, by position: grows with the cache
+    uint32_t last;                        // when the previous part ended
+    int tokens;
+} LlmProfile;
 
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len;
@@ -64,6 +102,7 @@ typedef struct {
     int rescore_k;             // when the classifier runs on the GPU, recompute its top K logits exactly on the CPU
     LlmGpuMatmulFn gpu_matmul; // set by whoever uploaded the matrices
     int topk[LLM_MAX_RESCORE];
+    LlmProfile *prof;          // optional: where each token's time goes (NULL = off)
 } LlmModel;
 
 typedef struct {

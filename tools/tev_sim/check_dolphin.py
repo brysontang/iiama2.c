@@ -64,7 +64,8 @@ def parse_bench(text):
         if m:
             for name, h in re.findall(r"(\w+) ([0-9a-f]{8})", m.group(2)):
                 hashes[(m.group(1), name)] = h
-    for m in re.finditer(r"\n\[(.+?)\] \d+ tokens.*?\n(?:  GPU:.*?\n)?  (.*?)(?=\n\[|\ndone|\Z)", text, re.DOTALL):
+    # each engine: a header, timing lines (GPU stats, the per-token profile), then the story
+    for m in re.finditer(r"\n\[(.+?)\] \d+ tokens.*?\n(?:  (?:GPU:|per token).*?\n)*  (.*?)(?=\n\[|\ndone|\Z)", text, re.DOTALL):
         stories[m.group(1)] = m.group(2)
     return hashes, stories
 
