@@ -353,6 +353,8 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         if (gxm_tokens_failed()) report("warning: GPU draw-sync tokens timed out; matmuls fell back to GX_DrawDone\n");
         free(x);
     }
+    int ps_total, ps_bad = llm_check_paired_singles(m, &ps_total);
+    if (ps_total) report("paired singles: %d of %d int8 matmul outputs differ from the scalar loop\n", ps_bad, ps_total);
 
     LlmSampler s;
     for (int e = 0; e < N_ENGINES; e++) {

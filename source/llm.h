@@ -108,6 +108,9 @@ int llm_init_sampler(LlmSampler *s, int vocab_size, float temperature, float top
 void llm_free_sampler(LlmSampler *s);
 
 float *llm_forward(LlmModel *m, int token, int pos);
+// On the Wii, int8 matmuls use paired singles. Compares them with the scalar loop on a few matrices:
+// returns how many output floats differ in any bit (0 expected), and how many were compared in *total.
+int llm_check_paired_singles(const LlmModel *m, int *total);
 int llm_encode(LlmTokenizer *t, const char *text, int bos, int eos, int *tokens, int *n_tokens);
 const char *llm_decode(LlmTokenizer *t, int prev_token, int token);
 int llm_sample(LlmSampler *s, float *logits);

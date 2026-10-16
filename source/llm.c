@@ -297,7 +297,7 @@ static void matmul_f32(float *xout, const float *x, const float *w, int n, int d
     }
 }
 
-static void matmul_q8(float *xout, const float *x, const int8_t *w, const float *s, int n, int d, int gs) {
+static void matmul_q8_scalar(float *xout, const float *x, const int8_t *w, const float *s, int n, int d, int gs) {
     int groups = n / gs;
     for (int i = 0; i < d; i++) {
         const int8_t *row = w + (size_t)i * n;
@@ -319,6 +319,107 @@ static void matmul_q8(float *xout, const float *x, const int8_t *w, const float 
         }
         xout[i] = val;
     }
+}
+
+#ifdef GEKKO
+#define GQR_S8 0x00060006u // load and store type s8, scale 0
+
+// One weight group of two rows with Broadway's paired singles: psq_l turns two int8 weights into floats
+// (GQR7 is set to s8) or loads two floats of x (GQR0, plain floats), and each ps_madd is two of the scalar
+// loop's fmadds, lane for lane. acc gets each row's four accumulators, a0..a3, for the caller to combine
+// the way matmul_q8_scalar does, so the results are the same floats with a third of the loads.
+static inline void q8_group2(const int8_t *r0, const int8_t *r1, const float *xx, int quads, float *acc) {
+    static const float zero[2] __attribute__((aligned(8))) = {0.0f, 0.0f};
+    double a01, a23, b01, b23, x01, x23, w01, w23, v01, v23;
+    __asm__ volatile("psq_l %[a01], 0(%[zero]), 0, 0\n\t"
+                     "ps_mr %[a23], %[a01]\n\t"
+                     "ps_mr %[b01], %[a01]\n\t"
+                     "ps_mr %[b23], %[a01]\n\t"
+                     "mtctr %[quads]\n"
+                     "1:\n\t"
+                     "psq_l %[x01], 0(%[xx]), 0, 0\n\t"
+                     "psq_l %[x23], 8(%[xx]), 0, 0\n\t"
+                     "psq_l %[w01], 0(%[r0]), 0, 7\n\t"
+                     "psq_l %[w23], 2(%[r0]), 0, 7\n\t"
+                     "psq_l %[v01], 0(%[r1]), 0, 7\n\t"
+                     "psq_l %[v23], 2(%[r1]), 0, 7\n\t"
+                     "addi %[xx], %[xx], 16\n\t"
+                     "addi %[r0], %[r0], 4\n\t"
+                     "addi %[r1], %[r1], 4\n\t"
+                     "ps_madd %[a01], %[w01], %[x01], %[a01]\n\t"
+                     "ps_madd %[a23], %[w23], %[x23], %[a23]\n\t"
+                     "ps_madd %[b01], %[v01], %[x01], %[b01]\n\t"
+                     "ps_madd %[b23], %[v23], %[x23], %[b23]\n\t"
+                     "bdnz 1b\n\t"
+                     "psq_st %[a01], 0(%[acc]), 0, 0\n\t"
+                     "psq_st %[a23], 8(%[acc]), 0, 0\n\t"
+                     "psq_st %[b01], 16(%[acc]), 0, 0\n\t"
+                     "psq_st %[b23], 24(%[acc]), 0, 0\n\t"
+                     : [a01] "=&f"(a01), [a23] "=&f"(a23), [b01] "=&f"(b01), [b23] "=&f"(b23), [x01] "=&f"(x01),
+                       [x23] "=&f"(x23), [w01] "=&f"(w01), [w23] "=&f"(w23), [v01] "=&f"(v01), [v23] "=&f"(v23),
+                       [xx] "+b"(xx), [r0] "+b"(r0), [r1] "+b"(r1)
+                     : [zero] "b"(zero), [quads] "r"(quads), [acc] "b"(acc)
+                     : "ctr", "memory");
+}
+#endif
+
+static void matmul_q8(float *xout, const float *x, const int8_t *w, const float *s, int n, int d, int gs) {
+#ifdef GEKKO
+    // paired loads of x want 8-byte alignment; malloc gives it, and groups keep it when gs % 4 == 0
+    if (gs % 4 == 0 && ((uintptr_t)x & 7) == 0) {
+        int groups = n / gs;
+        float acc[8] __attribute__((aligned(8)));
+        __asm__ volatile("mtspr 919, %0" : : "r"(GQR_S8)); // GQR7: load s8, unscaled
+        for (int i = 0; i < d; i += 2) {
+            int i1 = i + 1 < d ? i + 1 : i; // an odd last row goes through twice
+            const int8_t *r0 = w + (size_t)i * n, *r1 = w + (size_t)i1 * n;
+            const float *s0 = s + (size_t)i * groups, *s1 = s + (size_t)i1 * groups;
+            float val0 = 0.0f, val1 = 0.0f;
+            for (int g = 0; g < groups; g++) {
+                q8_group2(r0 + g * gs, r1 + g * gs, x + g * gs, gs / 4, acc);
+                val0 += ((acc[0] + acc[1]) + (acc[2] + acc[3])) * s0[g];
+                val1 += ((acc[4] + acc[5]) + (acc[6] + acc[7])) * s1[g];
+            }
+            xout[i] = val0;
+            xout[i1] = val1;
+        }
+        return;
+    }
+#endif
+    matmul_q8_scalar(xout, x, w, s, n, d, gs);
+}
+
+int llm_check_paired_singles(const LlmModel *m, int *total) {
+    *total = 0;
+#ifdef GEKKO
+    if (m->dtype != LLM_DTYPE_Q8) return 0;
+    init_lut(); // the scalar loop's int8 -> float table, normally built by the first forward pass
+    const LlmConfig *c = &m->c;
+    int n = c->dim > c->hidden_dim ? c->dim : c->hidden_dim, bad = 0;
+    float *x = (float *)malloc(n * sizeof(float)), *a = (float *)malloc(2 * 257 * sizeof(float)), *b = a + 257;
+    if (!x || !a) {
+        free(x);
+        free(a);
+        return -1;
+    }
+    for (int j = 0; j < n; j++) x[j] = sinf(j * 0.37f) * (1.0f + j % 7);
+    const LlmMatrix *mats[] = {&m->layers[0].wq, &m->layers[0].w2, &m->cls};
+    const int cols[] = {c->dim, c->hidden_dim, c->dim}, all[] = {c->dim, c->dim, c->vocab_size};
+    for (int k = 0; k < 3; k++) {
+        int rows = all[k] < 257 ? all[k] : 257;
+        rows -= rows % 2 == 0; // odd, so the last row takes the single-row path
+        matmul_q8(a, x, mats[k]->q, mats[k]->s, cols[k], rows, m->gs);
+        matmul_q8_scalar(b, x, mats[k]->q, mats[k]->s, cols[k], rows, m->gs);
+        for (int i = 0; i < rows; i++) bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        *total += rows;
+    }
+    free(x);
+    free(a);
+    return bad;
+#else
+    (void)m;
+    return 0;
+#endif
 }
 
 static void matmul(LlmModel *m, float *xout, const float *x, const LlmMatrix *w, int n, int d) {
