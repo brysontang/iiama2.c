@@ -7,13 +7,15 @@
 // the konst registers, a color register's value and how the framebuffer write
 // wraps, one multiply stage, the exact11 halving stages, and blending. The real
 // matmuls from the selftest are dumped too, and hashed more than once to see if
-// the GPU is even deterministic. Last, a CPU memory bandwidth test, with and
-// without dcbt prefetching.
+// the GPU is even deterministic. Then timings: raw register writes vs libogc's
+// setters, what limits the TEV's rate, and memory (where things live, CPU
+// streaming).
 #include "gx_probe.h"
 
 #include <malloc.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <gccore.h>
 #include <ogc/lwp_watchdog.h>
@@ -32,6 +34,8 @@ static void section(const char *name, const uint8_t *data, int w, int h) {
     fwrite(tag, 1, sizeof(tag), g_out);
     fwrite(wh, sizeof(uint32_t), 2, g_out); // big-endian on the Wii
     fwrite(data, 1, (size_t)w * h * 4, g_out);
+    fflush(g_out);
+    fsync(fileno(g_out));
     g_log("probe %-8s %dx%d\n", name, w, h);
 }
 
@@ -91,12 +95,25 @@ static void dump_matmul(void *gpu, const char *name, const float *x) {
     section(name, buf, w, hh);
 }
 
+// A matmul's float output, raw (big-endian floats, w = rows, h = 1): checks the CPU-side readback
+// arithmetic bit for bit, not just the GPU's integer sums.
+static void dump_output(void *gpu, const char *name, const float *x, int rows) {
+    float *y = (float *)malloc(rows * sizeof(float));
+    if (!y) return;
+    gxm_matmul(gpu, y, x);
+    section(name, (const uint8_t *)y, rows, 1);
+    free(y);
+}
+
 static void probe_matmuls(LlmModel *m, const float *x) {
     if (m->layers[0].w1.gpu) {
+        int hid = m->c.hidden_dim;
         gxm_set_mode(GXM_CLAMP8, 0.5f);
         dump_matmul(m->layers[0].w1.gpu, "w1_c8", x);
+        dump_output(m->layers[0].w1.gpu, "w1_c8_y", x, hid);
         gxm_set_mode(GXM_EXACT11, 1.0f);
         dump_matmul(m->layers[0].w1.gpu, "w1_e11", x);
+        dump_output(m->layers[0].w1.gpu, "w1e11_y", x, hid);
     }
     dump_matmul(m->cls.gpu, "cls_bl", x); // the blended classifier: one copy, one byte per row
 }
@@ -250,30 +267,94 @@ static void probe_blend(void) {
     copy_out("blend", 4 * N_BLEND, 8);
 }
 
-// CPU streaming reads over the classifier's weights (much bigger than the 256 KB L2), plain and with
-// dcbt touching N cache lines ahead. The CPU matmul and the readback both stream like this.
-static uint32_t stream(const uint32_t *w, size_t words, int ahead) {
+// Sums `words` words in order: how fast the CPU streams memory it doesn't have cached.
+static uint32_t stream(const uint32_t *w, size_t words) {
     uint32_t s = 0;
-    for (size_t i = 0; i < words; i += 8) {
-        if (ahead) __asm__ volatile("dcbt 0,%0" : : "r"(w + i + 8 * ahead));
+    for (size_t i = 0; i < words; i += 8)
         s += w[i] + w[i + 1] + w[i + 2] + w[i + 3] + w[i + 4] + w[i + 5] + w[i + 6] + w[i + 7];
-    }
     return s;
 }
 
+static unsigned long mb_per_s(size_t bytes, uint64_t t0, uint64_t t1) {
+    unsigned long us = ticks_to_microsecs(t1 - t0);
+    return us ? (unsigned long)(bytes / us) : 0;
+}
+
+// Where the big buffers live (cached addresses: MEM1 at 0x80000000, MEM2 at 0x90000000), and how fast the
+// CPU streams each. (Locked-cache DMA into 0xE0000000 was tried here too: on a Wii, libogc's LCLoadData
+// ended in a Machine Check exception.)
 static void probe_memory(LlmModel *m) {
-    const uint32_t *w = m->cls.q ? (const uint32_t *)m->cls.q : (const uint32_t *)m->cls.f;
-    size_t bytes = (size_t)m->c.vocab_size * m->c.dim * (m->cls.q ? 1 : 4) & ~(size_t)31;
-    static const int ahead[] = {0, 1, 2, 4, 8, 16, 0};
+    size_t tex_bytes = 0;
+    const void *tex = m->cls.gpu ? gxm_texture_memory(m->cls.gpu, &tex_bytes) : NULL;
+    int w, h;
+    const void *copy = gxm_last_copy(&w, &h);
+    struct { const char *name; const void *p; size_t bytes; } r[] = {
+        {"int8 output layer", m->cls.q, m->cls.q ? (size_t)m->c.vocab_size * m->c.dim : 0},
+        {"output layer textures", tex, tex_bytes},
+        {"int8 layer 0 wq", m->layers[0].wq.q, 0},
+        {"framebuffer copies", copy, 0},
+        {"KV cache", m->key_cache, 0},
+    };
     volatile uint32_t sink = 0;
-    for (int i = 0; i < (int)(sizeof(ahead) / sizeof(ahead[0])); i++) {
+    for (int i = 0; i < (int)(sizeof(r) / sizeof(r[0])); i++) {
+        if (!r[i].p) continue;
+        size_t bytes = (r[i].bytes > (8u << 20) ? (8u << 20) : r[i].bytes) & ~(size_t)31;
+        if (bytes < (1u << 20)) {
+            g_log("memory: %-22s at %08lx\n", r[i].name, (unsigned long)(uintptr_t)r[i].p);
+            continue;
+        }
+        const uint32_t *p = (const uint32_t *)(((uintptr_t)r[i].p + 31) & ~(uintptr_t)31);
         uint64_t t0 = gettime();
-        sink += stream(w, bytes / 4, ahead[i]);
+        sink += stream(p, bytes / 4 - 8);
         uint64_t t1 = gettime();
-        g_log("memory: %lu KB, dcbt %2d lines ahead: %lu MB/s\n", (unsigned long)(bytes / 1024), ahead[i],
-              (unsigned long)(bytes / ticks_to_microsecs(t1 - t0)));
+        g_log("memory: %-22s at %08lx, %lu KB streamed: %lu MB/s\n", r[i].name, (unsigned long)(uintptr_t)r[i].p,
+              (unsigned long)(bytes >> 10), mb_per_s(bytes, t0, t1));
     }
     (void)sink;
+}
+
+// What limits the TEV: the blended output layer's passes with fewer stages, without textures, with one
+// small texture that stays cached, and with the same texture memory read as smaller texel formats.
+static void probe_rate(LlmModel *m) {
+    static const struct { const char *name; int stages, fmt, tiny; } v[] = {
+        {"RGBA8, 16 stages", 16, GX_TF_RGBA8, 0},    {"RGBA8, 8 stages", 8, GX_TF_RGBA8, 0},
+        {"RGBA8, 4 stages", 4, GX_TF_RGBA8, 0},      {"RGBA8, 1 stage", 1, GX_TF_RGBA8, 0},
+        {"no texture, 16 stages", 16, -1, 0},        {"one small texture, 16 stages", 16, GX_TF_RGBA8, 1},
+        {"read as RGB565, 16 stages", 16, GX_TF_RGB565, 0}, {"read as IA8, 16 stages", 16, GX_TF_IA8, 0},
+        {"read as I8, 16 stages", 16, GX_TF_I8, 0},  {"RGBA8, 16 stages again", 16, GX_TF_RGBA8, 0},
+    };
+    if (!m->cls.gpu) return;
+    for (int i = 0; i < (int)(sizeof(v) / sizeof(v[0])); i++)
+        g_log("tev: %-30s %7.3f ms\n", v[i].name, gxm_time_draws(m->cls.gpu, v[i].stages, v[i].fmt, v[i].tiny));
+}
+
+// Raw register writes vs libogc's setters: the integer sums must match, and the times show what libogc
+// cost. Layer 0's w2 (48 passes) ten times each way, in both output modes.
+static void probe_issue(LlmModel *m, const float *x) {
+    void *w1 = m->layers[0].w1.gpu, *w2 = m->layers[0].w2.gpu;
+    float *y = (float *)malloc(m->c.dim * sizeof(float));
+    if (!w1 || !w2 || !y) {
+        free(y);
+        return;
+    }
+    for (int mode = 0; mode < 2; mode++) {
+        gxm_set_mode(mode ? GXM_EXACT11 : GXM_CLAMP8, mode ? 1.0f : 0.5f);
+        for (int raw = 1; raw >= 0; raw--) {
+            gxm_set_raw_issue(raw);
+            uint32_t h1 = gxm_partials_hash(w1, x), h2 = gxm_partials_hash(w2, x);
+            GxmStats st;
+            gxm_reset_stats();
+            for (int i = 0; i < 10; i++) gxm_matmul(w2, y, x);
+            gxm_get_stats(&st);
+            g_log("issue %s %-6s: w1 %08lx w2 %08lx | w2 x10: issuing %lu us, waiting %lu us, reading back %lu us\n",
+                  mode ? "exact11" : "clamp8", raw ? "raw" : "libogc", (unsigned long)h1, (unsigned long)h2,
+                  (unsigned long)ticks_to_microsecs(st.draw_ticks), (unsigned long)ticks_to_microsecs(st.wait_ticks),
+                  (unsigned long)ticks_to_microsecs(st.reduce_ticks));
+        }
+    }
+    gxm_set_raw_issue(1);
+    gxm_reset_stats();
+    free(y);
 }
 
 int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
@@ -291,8 +372,14 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     int n = m->c.dim > m->c.hidden_dim ? m->c.dim : m->c.hidden_dim;
     float *x = (float *)malloc(n * sizeof(float));
     for (int j = 0; j < n; j++) x[j] = (float)(((j * 37) % 101) - 50) / 16.0f; // the selftest's input
+    // a line before each step, so a crash or hang shows on screen (and in probe_out.txt) where it was
+    log("probe: matmuls\n");
     if (m->cls.gpu) probe_matmuls(m, x);
+    if (gxm_tokens_failed()) log("warning: GPU draw-sync tokens timed out; matmuls fell back to GX_DrawDone\n");
+    log("probe: raw issue vs libogc\n");
+    if (m->cls.gpu) probe_issue(m, x);
     free(x);
+    log("probe: TEV arithmetic\n");
 
     probe_texture();
     probe_konst();
@@ -301,6 +388,9 @@ int gxp_run(LlmModel *m, const char *bin_path, GxpLogFn log) {
     probe_div();
     probe_blend();
     gxm_forget_layout();
+    log("probe: TEV rate\n");
+    probe_rate(m);
+    log("probe: memory\n");
     probe_memory(m);
 
     fclose(g_out);

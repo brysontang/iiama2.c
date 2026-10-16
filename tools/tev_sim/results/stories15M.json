@@ -34,27 +34,27 @@
    },
    "label": "split (blend/16 cols, headroom 0.25, CPU top-256)"
   },
-  "gpu+blend:clamp8:16:0.5:256": {
-   "top1": 0.9064124783362218,
-   "kl": 0.040320487533203185,
-   "ppl": 2.880269506755955,
+  "gpu+blend:clamp8+rows:16:0.5:256": {
+   "top1": 0.9220103986135182,
+   "kl": 0.027266990778636722,
+   "ppl": 2.8418252968246036,
    "positions": 1154,
    "saturation": {
-    "wq": 0.0182471362357447,
-    "wk": 0.018209609089158484,
-    "wv": 0.01603899658372025,
-    "wo": 0.01728249076392009,
-    "w1": 0.018235612727202217,
-    "w2": 0.0047831231813124505,
-    "w3": 0.018021492774728802,
-    "cls": 0.06746550043327557
+    "wq": 0.0029663997475233754,
+    "wk": 0.0028869993260157907,
+    "wv": 0.002540144853114235,
+    "wo": 0.0026259530279364673,
+    "w1": 0.0031190575052955903,
+    "w2": 0.00019952490130945504,
+    "w3": 0.002999225553362432,
+    "cls": 0.06339525563258232
    },
-   "label": "GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256"
+   "label": "GPU only (clamp8/16 cols, headroom 0.5, row scales), blended classifier + CPU top-256"
   },
   "gpu+blend:exact11:8:1.0:256": {
-   "top1": 0.9714038128249567,
-   "kl": 0.005699172494416186,
-   "ppl": 2.7798705405026336,
+   "top1": 0.9696707105719238,
+   "kl": 0.005354133315284368,
+   "ppl": 2.7776546887849753,
    "positions": 1154,
    "saturation": {
     "wq": 0.0,
@@ -64,53 +64,26 @@
     "w1": 0.0,
     "w2": 0.0,
     "w3": 0.0,
-    "cls": 0.07123648721837088
+    "cls": 0.07060314666377816
    },
    "label": "GPU only (exact11/8 cols, headroom 1.0), blended classifier + CPU top-256"
   },
-  "split:clamp8:16:0.5:64": {
-   "top1": 0.9844020797227037,
-   "kl": 0.0007556349995478734,
-   "ppl": 2.770752887671896,
+  "gpu+blend:clamp8:16:0.5:256": {
+   "top1": 0.9003466204506065,
+   "kl": 0.039815994453957046,
+   "ppl": 2.8772665889703255,
    "positions": 1154,
    "saturation": {
-    "cls": 0.012291412418159061
+    "wq": 0.01819177881906555,
+    "wk": 0.01815263580425216,
+    "wv": 0.016000550063832365,
+    "wo": 0.01719665472930084,
+    "w1": 0.018191743994319276,
+    "w2": 0.00477047135099065,
+    "w3": 0.017974385340442264,
+    "cls": 0.06569898180242634
    },
-   "label": "split (clamp8/16 cols, headroom 0.5, CPU top-64)"
-  },
-  "gpu:clamp8:16:0.5": {
-   "top1": 0.8734835355285961,
-   "kl": 0.06076140321512407,
-   "ppl": 2.971177449830116,
-   "positions": 1154,
-   "saturation": {
-    "wq": 0.0182471362357447,
-    "wk": 0.018209609089158484,
-    "wv": 0.01603899658372025,
-    "wo": 0.01728249076392009,
-    "w1": 0.018235612727202217,
-    "w2": 0.0047831231813124505,
-    "w3": 0.018021492774728802,
-    "cls": 0.012222280894954746
-   },
-   "label": "GPU only (clamp8/16 cols, headroom 0.5)"
-  },
-  "gpu:exact11:8:1.0": {
-   "top1": 0.9688041594454073,
-   "kl": 0.002205158756151043,
-   "ppl": 2.772576470216599,
-   "positions": 1154,
-   "saturation": {
-    "wq": 0.0,
-    "wk": 0.0,
-    "wv": 0.0,
-    "wo": 0.0,
-    "w1": 0.0,
-    "w2": 0.0,
-    "w3": 0.0,
-    "cls": 0.0
-   },
-   "label": "GPU only (exact11/8 cols, headroom 1.0)"
+   "label": "GPU only (clamp8/16 cols, headroom 0.5), blended classifier + CPU top-256"
   }
  },
  "reference": {
@@ -129,12 +102,12 @@
   },
   "clamp8:16:0.5": {
    "recall": {
-    "1": 0.9176776429809359,
+    "1": 0.9185441941074524,
     "4": 0.9991334488734835,
     "16": 1.0,
     "64": 1.0
    },
-   "nucleus_in_top64": 0.9776146131805158
+   "nucleus_in_top64": 0.9777936962750716
   },
   "exact11:8:1.0": {
    "recall": {
@@ -183,63 +156,39 @@
     "diverges_from_q8_at": null
    }
   ],
-  "gpu+blend:clamp8:16:0.5:256": [
+  "gpu+blend:clamp8+rows:16:0.5:256": [
    {
     "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. She knew that meant it might rain soon.\nLily went inside her house and saw her mommy cooking in the kitchen. \"Mommy, can I help you cook?\" Lily asked. \"Sure, sweetie,\" her mommy replied.\nLily helped her mommy make a yummy soup. They put the soup in a pot and waited for it to cook.",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. She knew that meant rain was coming.\nLily ran inside her house and told her mommy about the rain. Her mommy said, \"Let's make some hot cocoa to warm up!\" Lily loved hot cocoa, so she said, \"Yay! I love hot cocoa!\"\nThey made hot cocoa together and sat down to drink it. Lily's",
     "diverges_from_q8_at": 34
    },
    {
     "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of treasure. Suddenly, he heard a voice.\n\"What are you doing?\" asked the voice.\nThe king looked around and saw a little girl. She was only three years old.\n\"I'm looking for treasure,\" the king said.\nThe little girl smiled. \"I know where to find it. Follow me!\"\nThe king followed the little girl and they walked through the forest. The little girl pointed to a tree and said, \"Look,",
-    "diverges_from_q8_at": 22
+    "text": "The grumpy turtle king was walking in the forest. He was very tired and wanted to rest. He saw a big tree and decided to rest under it. The tree was very old and had many leaves. The king king sat down and closed his eyes.\nSuddenly, he heard a loud noise. He opened his eyes and saw a big bird flying towards him. The bird was very hungry and wanted to eat the king king. The king king was very scared and didn't know what to do. He tried to run away, but the bird was",
+    "diverges_from_q8_at": 17
    }
   ],
   "gpu+blend:exact11:8:1.0:256": [
    {
     "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she saw a big, strong man walking by. He was very reliable and always helped her when she needed it.\nLily asked the man if he could help",
-    "diverges_from_q8_at": 89
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she had an idea. She would use a stick to get the ball down.\nLily found a stick and tried to reach the ball. She poked the",
+    "diverges_from_q8_at": 109
    },
    {
     "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a little girl. She was playing in the sand and was making a sand castle.\nThe king said to the little girl, \"What are you doing?\"\nThe little girl said, \"I'm making a castle!\"\nThe king said, \"That's very nice. Can I help you?\"\nThe little girl said, \"Yes, please!\"\nSo the king and the little girl worked together to make the castle. They used st",
+    "text": "The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a little girl. She was playing in the sand and she was making a sand castle.\nThe king said to the little girl, \"What are you doing?\"\nThe little girl said, \"I'm making a castle!\"\nThe king said, \"That's very nice. Can I help you?\"\nThe little girl said, \"Yes, please!\"\nSo the king and the little girl worked together to make the castle. They used",
     "diverges_from_q8_at": 11
    }
   ],
-  "split:clamp8:16:0.5:64": [
+  "gpu+blend:clamp8:16:0.5:256": [
    {
     "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump and reach it, but she couldn't. Then, she had an idea. She would use a stick to get the ball down.\nLily found a long stick and tried to reach the ball. She poked",
-    "diverges_from_q8_at": null
-   },
-   {
-    "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking in the forest. He was carrying a big bag of food. Suddenly, he heard a loud noise. He looked up and saw a big bird flying above him. The bird was carrying a big bag of food.\nThe king was very angry. He shouted at the bird and said, \"That's my food! Give it back!\" The bird just flew away. The king was so angry that he started to cry.\nThe king's friend, a little rabbit, came to see what was wrong. The",
-    "diverges_from_q8_at": null
-   }
-  ],
-  "gpu:clamp8:16:0.5": [
-   {
-    "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. It looked like a big, fluffy pillow. Lily knew that meant it might rain soon.\nLily's mommy told her to come inside before it started to rain. Lily didn't want to go inside, but she knew her mommy was right. She went inside and watched the rain. It was wet outside, but she was happy to be inside.\n",
+    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, dark cloud in the sky. She knew that meant rain was coming. \nLily ran inside her house and told her mommy about the rain. Her mommy said, \"Let's make some hot cocoa to warm up!\" Lily loved hot cocoa. \nThey made hot cocoa and drank it while they watched the rain. Lily felt warm and cozy. She was happy that she got",
     "diverges_from_q8_at": 34
    },
    {
     "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking along the beach. He was looking for something special. He saw a big, shiny rock and he decided to take it.\nThe king said, \"This rock is mine!\" He was so happy. He took the rock and put it in his pocket.\nThe king was so happy with his new rock. He said, \"This rock is mine now!\" He took the rock and went back to his castle.\nThe king was so happy with his new rock. He put it on the table and went to sleep. The next morning",
-    "diverges_from_q8_at": 11
-   }
-  ],
-  "gpu:exact11:8:1.0": [
-   {
-    "prompt": "Once upon a time",
-    "text": "Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red ball in the sky. It was the sun! She thought it was so pretty.\nLily wanted to play with the ball, but it was too high up in the sky. She tried to jump, but she couldn't reach it. She felt sad.\nThen, Lily had an idea. She found a big box and put it under the ball. She climbed on the box and reached up high.",
-    "diverges_from_q8_at": 76
-   },
-   {
-    "prompt": "The grumpy turtle king",
-    "text": "The grumpy turtle king was walking along the beach. He was looking for something to do. Suddenly, he saw a little girl. She was playing in the sand and was making a sand castle. The king was so excited that he started to clap his hands.\nThe little girl was so happy that she started to clap too. She was so happy that she started to dance. The king was so surprised that he stopped clapping and started to laugh.\nThe little girl was so happy that she started to clap too. She kept on clapping and",
+    "text": "The grumpy turtle king was walking along the beach. He was looking for something to eat. Suddenly, he saw a big, juicy apple. He was so excited that he quickly grabbed it.\nThe king said, \"I'm going to eat this apple!\" But the apple was too big and he couldn't eat it. He tried to pull it out of the sand, but it was too heavy.\nThe king was so angry that he shouted, \"I will eat this apple!\" He started to eat the apple. But the apple",
     "diverges_from_q8_at": 11
    }
   ]

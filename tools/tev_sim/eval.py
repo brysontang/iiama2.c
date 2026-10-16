@@ -22,7 +22,8 @@ Then shows greedy stories from each backend so you can read the damage.
 
 Variants are kind:mode:cols:headroom[:k], e.g. split:blend:16:0.25:256 or
 gpu:exact11:8:1.0. kind is split, gpu, gpu+rescore, or gpu+blend (the classifier
-blended, with the CPU recomputing its top k; mode is the layers').
+blended, with the CPU recomputing its top k; mode is the layers'). A mode ending
+in +rows gives the layers one weight scale per row (clamp8+rows: the app's GPU fast).
 """
 import argparse
 import json
@@ -37,9 +38,9 @@ from llama import F32, Q8, Tokenizer, Transformer, Weights, generate, softmax
 PROMPTS = ["Once upon a time", "The grumpy turtle king", "One day, a little girl named Lily",
            "Tom and his dog went to the park", "There was a brave little robot", ""]
 
-# the app's engines (source/main.c), then the ones they replaced
-DEFAULT_VARIANTS = ["split:blend:16:0.25:256", "gpu+blend:clamp8:16:0.5:256", "gpu+blend:exact11:8:1.0:256",
-                    "split:clamp8:16:0.5:64", "gpu:clamp8:16:0.5", "gpu:exact11:8:1.0"]
+# the app's engines (source/main.c), then GPU fast with the CPU's per-group scales, which it replaced
+DEFAULT_VARIANTS = ["split:blend:16:0.25:256", "gpu+blend:clamp8+rows:16:0.5:256", "gpu+blend:exact11:8:1.0:256",
+                    "gpu+blend:clamp8:16:0.5:256"]
 
 
 def make_backend(W, spec):
@@ -49,14 +50,16 @@ def make_backend(W, spec):
         return Q8(W)
     kind, mode, cols, headroom, *k = spec.split(":")
     cols, headroom = int(cols), float(headroom)
+    rows = mode.endswith("+rows")
+    mode = mode.removesuffix("+rows")
     if kind == "split":
         return Split(W, mode, headroom, cols, int(k[0]) if k else 64)
     if kind == "gpu":
-        return GPU(W, mode, headroom, cols)
+        return GPU(W, mode, headroom, cols, row_scales=rows)
     if kind == "gpu+rescore":
-        return GPU(W, mode, headroom, cols, rescore_k=int(k[0]) if k else 64)
+        return GPU(W, mode, headroom, cols, rescore_k=int(k[0]) if k else 64, row_scales=rows)
     if kind == "gpu+blend":
-        return GPU(W, mode, headroom, cols, rescore_k=int(k[0]) if k else 256, blend_cls=True)
+        return GPU(W, mode, headroom, cols, rescore_k=int(k[0]) if k else 256, blend_cls=True, row_scales=rows)
     raise SystemExit(f"unknown variant {spec}")
 
 

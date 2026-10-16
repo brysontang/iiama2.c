@@ -17,6 +17,7 @@ typedef struct {
     uint32_t matmuls, draws;
 } GxmStats;
 
+int gxm_reserve(void); // before loading the model: a small framebuffer-copy buffer in MEM1 (optional)
 int gxm_init(void);
 void gxm_set_mode(int out_mode, float headroom);
 
@@ -35,10 +36,19 @@ void gxm_matmul(void *gpu, float *xout, const float *x); // an LlmGpuMatmulFn
 // (row-major, int16 little-endian) for input x. For the blended classifier, each row's whole sum.
 uint32_t gxm_partials_hash(void *gpu, const float *x);
 
-// For gx_probe.c: the latest framebuffer copy (RGBA8 tiles, w x h pixels), and a way to say
-// the TEV setup was changed behind gx_matmul.c's back.
+// For gx_probe.c: the latest framebuffer copy (RGBA8 tiles, w x h pixels), a way to say the TEV
+// setup was changed behind gx_matmul.c's back, and a switch between writing the per-pass GPU
+// registers directly (the default) and going through libogc's setters.
 const uint8_t *gxm_last_copy(int *w, int *h);
 void gxm_forget_layout(void);
+void gxm_set_raw_issue(int on);
+int gxm_tokens_failed(void); // draw-sync tokens timed out, so matmuls fell back to GX_DrawDone
+
+// Also for gx_probe.c: a matrix's texture memory, and how long (ms) the GPU takes to draw a blended
+// matrix's passes with `stages` TEV stages, sampling its textures (fmt GX_TF_RGBA8, or the same memory
+// read as a smaller texel format), one small texture over and over (tiny), or no texture (fmt < 0).
+const void *gxm_texture_memory(void *gpu, size_t *bytes);
+float gxm_time_draws(void *gpu, int stages, int fmt, int tiny);
 
 void gxm_get_stats(GxmStats *out);
 void gxm_reset_stats(void);

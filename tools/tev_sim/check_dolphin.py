@@ -31,10 +31,10 @@ from llama import Q8, Tokenizer, Weights, generate
 ENGINES = [
     ("CPU", lambda W: Q8(W)),
     ("split (GPU classifier + CPU top-256)", lambda W: Split(W, "blend", BLEND["headroom"], 16, RESCORE_K)),
-    ("GPU, fast (clamp8)", lambda W: GPU(W, "clamp8", 0.5, 16, rescore_k=RESCORE_K, blend_cls=True)),
+    ("GPU, fast (clamp8)", lambda W: GPU(W, "clamp8", 0.5, 16, rescore_k=RESCORE_K, blend_cls=True, row_scales=True)),
     ("GPU, exact (exact11)", lambda W: GPU(W, "exact11", 1.0, 8, rescore_k=RESCORE_K, blend_cls=True)),
 ]
-CHECKS = [("clamp8", 0.5, 16), ("exact11", 1.0, 8)]
+CHECKS = [("clamp8", 0.5, 16), ("exact11", 1.0, 8)]  # clamp8 runs on the per-row-scale twins
 
 
 def fnv1a_partials(partial):
@@ -51,7 +51,7 @@ def selftest(W):
     out = {("blend", "cls"): f"{fnv1a_partials(m.tev_partials(x[: m.n])[0]):08x}"}
     for mode, headroom, cols in CHECKS:
         for name, key in (("w1", ("w1", 0)), ("w2", ("w2", 0))):
-            m = TevMatrix(W.f32[key], mode, headroom, cols)
+            m = TevMatrix(W.f32[key], mode, headroom, cols, row_scales=mode == "clamp8")
             partial, _ = m.tev_partials(x[: m.n])
             out[(mode, name)] = f"{fnv1a_partials(partial):08x}"
     return out

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <fat.h>
 #include <gccore.h>
@@ -238,6 +239,7 @@ static int try_load(LlmModel *m, LlmTokenizer *t, const char *root) {
     fclose(probe);
 
     say("  Loading %s\n", model_path);
+    gxm_reserve(); // first, so the GPU's framebuffer copies land in MEM1
     if (llm_load_model(m, model_path, on_progress, NULL)) {
         say("\n\n  Couldn't load the model: %s\n", llm_error());
         wait_for_home();
@@ -295,7 +297,11 @@ static void report(const char *fmt, ...) {
     va_end(ap);
     fputs(buf, stdout);
     SYS_Report("%s", buf);
-    if (g_bench_file) { fputs(buf, g_bench_file); fflush(g_bench_file); }
+    if (g_bench_file) { // synced line by line, so a crash or hang still leaves the log on the card
+        fputs(buf, g_bench_file);
+        fflush(g_bench_file);
+        fsync(fileno(g_bench_file));
+    }
 }
 
 static char g_story[4096];
@@ -344,6 +350,7 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
                    (unsigned long)gxm_partials_hash(m->layers[0].w1.gpu, x),
                    (unsigned long)gxm_partials_hash(m->layers[0].w2.gpu, x));
         }
+        if (gxm_tokens_failed()) report("warning: GPU draw-sync tokens timed out; matmuls fell back to GX_DrawDone\n");
         free(x);
     }
 
@@ -397,7 +404,8 @@ static void run_probe(LlmModel *m, const char *root) {
     snprintf(path, sizeof(path), "%s/llama/probe_out.txt", root);
     g_bench_file = fopen(path, "w");
     clear_screen();
-    report("iiama2.c GPU probe\n%s\n", g_gpu_note);
+    report("iiama2.c GPU probe\n%s\nfree: MEM1 %lu KB, MEM2 %lu KB\n", g_gpu_note,
+           (unsigned long)(SYS_GetArena1Size() / 1024), (unsigned long)(SYS_GetArena2Size() / 1024));
     if (g_gpu_cls) {
         snprintf(path, sizeof(path), "%s/llama/probe.bin", root);
         gxp_run(m, path, report);

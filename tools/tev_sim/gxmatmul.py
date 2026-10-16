@@ -6,7 +6,8 @@ Layout (one draw = one "pass" over `cols` input columns):
   * Each framebuffer pixel holds 3 output rows, one per RGB channel. Every
     channel does the same math, so the simulator just treats rows as rows.
   * Weights live in an RGBA8 texture as offset-binary bytes, Wu = q + 128,
-    where q is the same int8 (per-row, per-group-of-32 scale) the CPU uses.
+    where q is the same int8 (per-row, per-group-of-32 scale) the CPU uses,
+    or (row_scales) that int8 requantized with one scale per row.
   * The activations for the pass go in the 4 konst colors: 16 bytes, one per
     stage, picked with KCSEL K0_R..K3_A. Every row multiplies the same x, so x
     never needs to be a texture. Each pass gets its own x scale (its max |x|).
@@ -23,6 +24,9 @@ Output modes, i.e. how each pass's 11-bit PREV gets out through 8-bit pixels:
 
   clamp8   16 columns/pass, the sum starts at 128, last stage clamps to [0, 255].
            Partial sums outside [-128, 127] saturate. 1 draw per 16 columns.
+           The GPU-fast engine uses it with row_scales: smaller weights saturate
+           less (0.3% of partial sums instead of 1.8%), which more than pays
+           for the coarser scale, and the readback gets cheaper.
   exact11  8 columns/pass, 2 draws: one writes PREV's low byte (u8 wrap), one
            runs 3 extra halving stages and writes floor(PREV/8) + 128. The CPU
            rebuilds the exact 11-bit sum. 2 draws per 8 columns.
@@ -54,11 +58,26 @@ from tev import (
 MODES = {"clamp8": 16, "exact11": 8}
 
 
+def requantize_rows(w_f32, group_size):
+    """The CPU's per-group int8, requantized with one scale per row (gx_matmul.c's wu()). Returns (q, s)."""
+    rows, n = w_f32.shape
+    q, s, _ = quantize_q8(w_f32, group_size)
+    w_cpu = q.astype(np.float32).reshape(rows, -1, group_size) * s.reshape(rows, -1, 1)  # what the CPU has
+    qr, sr, _ = quantize_q8(w_cpu.reshape(rows, n), n)
+    return qr.reshape(rows, n), sr
+
+
+def fma32(a, b, c):
+    """float32 a * b + c with one rounding, like Broadway's fmadds and ps_madds0."""
+    return (np.float64(a) * np.asarray(b, np.float64) + np.asarray(c, np.float64)).astype(np.float32)
+
+
 def quantize_x(xs, headroom):
     """Per-pass activation quantization. xs: (passes, cols). Returns konst bytes c, effective c', scale."""
     xmax = np.abs(xs).max(axis=1)
     xmax = np.where(xmax == 0, 1.0, xmax).astype(np.float32)
-    t = np.abs(xs) / xmax[:, None] * (256.0 * headroom)
+    inv = np.float32(256.0 * headroom) / xmax  # gx_matmul.c's quantize: one division, float32 throughout
+    t = np.abs(xs).astype(np.float32) * inv[:, None]
     cp = np.clip(np.rint(t), 0, 256).astype(np.int32)
     # c' = c + (c >> 7) can't produce 128, so snap to the nearer of 127 / 129
     cp = np.where(cp == 128, np.where(t >= 128, 129, 127), cp)
@@ -67,7 +86,7 @@ def quantize_x(xs, headroom):
 
 
 class TevMatrix:
-    def __init__(self, w_f32, mode="clamp8", headroom=1.0, cols=None, group_size=32):
+    def __init__(self, w_f32, mode="clamp8", headroom=1.0, cols=None, group_size=32, row_scales=False):
         self.mode, self.cols, self.headroom = mode, cols or MODES[mode], headroom
         assert self.cols <= MODES[mode], f"{mode} fits at most {MODES[mode]} columns per pass"
         rows, n = w_f32.shape
@@ -77,9 +96,13 @@ class TevMatrix:
         n_pad = -(-n // self.gs) * self.gs
         wp = np.zeros((rows, n_pad), np.float32)
         wp[:, :n] = w_f32
-        q, s, _ = quantize_q8(wp, self.gs)
-        self.q = q.reshape(rows, n_pad)
-        self.s = s.reshape(rows, n_pad // self.gs)
+        self.row_scales = row_scales
+        if row_scales:
+            self.q, self.srow = requantize_rows(wp, self.gs)
+        else:
+            q, s, _ = quantize_q8(wp, self.gs)
+            self.q = q.reshape(rows, n_pad)
+            self.s = s.reshape(rows, n_pad // self.gs)
         self.wu = (self.q.astype(np.int32) + 128).reshape(rows, -1, self.cols)  # texture bytes
         self.passes = n_pad // self.cols
         self.stats = {"calls": 0, "partials": 0, "saturated": 0}
@@ -122,11 +145,17 @@ class TevMatrix:
 
     def __call__(self, x):
         partial, xscale = self.tev_partials(x)
+        if self.row_scales:
+            # gx_matmul.c's sum_pixel: acc = fma(x scale, byte - 128, acc) pass by pass, then the row scale
+            acc = np.zeros(partial.shape[0], np.float32)
+            for p in range(self.passes):
+                acc = fma32(xscale[p], partial[:, p], acc)
+            return self.srow * acc
         per_group = self.gs // self.cols
-        # same float32 order as gx_matmul.c: y += (s * xscale) * partial, pass by pass
+        # gx_matmul.c's reduce_batch: y = fma(s * xscale, partial, y) pass by pass (GCC fuses it into fmadds)
         y = np.zeros(partial.shape[0], np.float32)
         for p in range(self.passes):
-            y += (self.s[:, p // per_group] * xscale[p]) * partial[:, p].astype(np.float32)
+            y = fma32(self.s[:, p // per_group] * xscale[p], partial[:, p], y)
         return y
 
 
@@ -162,11 +191,8 @@ class BlendMatrix:
         rows, n = w_f32.shape
         assert n % self.cols == 0
         self.n, self.headroom, self.a0, self.c0 = n, headroom, a0, c0
-        q, s, _ = quantize_q8(w_f32, group_size)
-        w_cpu = q.astype(np.float32).reshape(rows, -1, group_size) * s.reshape(rows, -1, 1)  # what the CPU has
-        qr, sr, _ = quantize_q8(w_cpu.reshape(rows, n), n)
-        self.s = sr  # (rows,)
-        self.wu = (qr.reshape(rows, n).astype(np.int32) + 128).reshape(rows, -1, self.cols)
+        qr, self.s = requantize_rows(w_f32, group_size)  # self.s: (rows,)
+        self.wu = (qr.astype(np.int32) + 128).reshape(rows, -1, self.cols)
         self.passes = n // self.cols
         self.stats = {"calls": 0, "partials": 0, "saturated": 0}
 
@@ -212,11 +238,13 @@ class BlendMatrix:
 class GPU:
     """Every weight matmul on the TEV (attention, norms and SiLU stay on the CPU)."""
 
-    def __init__(self, W, mode="clamp8", headroom=1.0, cols=None, rescore_k=0, blend_cls=False):
-        self.mats = {k: TevMatrix(m, mode, headroom, cols) for k, m in W.f32.items() if k not in ("emb", "cls")}
+    def __init__(self, W, mode="clamp8", headroom=1.0, cols=None, rescore_k=0, blend_cls=False, row_scales=False):
+        self.mats = {k: TevMatrix(m, mode, headroom, cols, row_scales=row_scales)
+                     for k, m in W.f32.items() if k not in ("emb", "cls")}
         self.mats["cls"] = BlendMatrix(W.f32["cls"]) if blend_cls else TevMatrix(W.f32["cls"], mode, headroom, cols)
         cols = self.mats[("w1", 0)].cols
-        self.label = (f"GPU only ({mode}/{cols} cols, headroom {headroom})" + (", blended classifier" if blend_cls else "")
+        self.label = (f"GPU only ({mode}/{cols} cols, headroom {headroom}" + (", row scales" if row_scales else "") + ")"
+                      + (", blended classifier" if blend_cls else "")
                       + (f" + CPU top-{rescore_k}" if rescore_k else ""))
         self.rescore_k = rescore_k
         self.cls_q8 = W.dequant("cls") if rescore_k else None

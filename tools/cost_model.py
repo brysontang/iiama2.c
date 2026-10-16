@@ -4,7 +4,7 @@ Costs each engine in source/main.c on a real Wii, fitted to one.
 
     python3 tools/cost_model.py models/stories15M.bin
     python3 tools/cost_model.py models/stories15M.bin --pos 200 --sampling
-    python3 tools/cost_model.py models/stories15M.bin --before   # before the blended classifier
+    python3 tools/cost_model.py models/stories15M.bin --before   # the engines as first run on a Wii
 
 Bottom-up: count the work each engine does per token, cost it with per-
 operation numbers, and add memory traffic at an effective bandwidth. Dolphin
@@ -16,18 +16,21 @@ Where the numbers come from:
                 4 MACs per loop, 4 lbz + 4 lfsx (LUT) + 4 lfs (x) = 12 loads on
                 Broadway's single load/store unit -> 3 cycles/MAC, plus about
                 8 cycles of per-group overhead every 32 MACs.
-  GX issue      ~3,600 instructions per 16-column pass (Dolphin's instruction
-                count for the GX calls; libogc does read-modify-write on shadow
-                registers). The Wii agreed within 10%.
+  GPU           measured by the probe (gx_probe.c): the TEV does 951M pixel-
+                stages/s when texture fetch keeps up, and RGBA8 textures stream
+                from MEM2 at 1.9 GB/s, which holds it to half that.
+  issue         measured by the probe: cycles per pass, raw register writes
+                now, libogc's setters before.
+  readback      fitted to the bench, all in (instructions and cache misses):
+                per pixel and pass for GPU fast, per row and pass for exact11,
+                per row for the blended output layer.
   the rest      fitted to the bench on a real Wii (README, "Speed"): CPU memory
-                bandwidth, the readback loop's real cost (cache misses on the
-                framebuffer copy make it ~13 cycles per row and pass, not the
-                ~3.3 its instructions suggest), TEV rate, copy rate, sync cost.
-                Fitted totals land within 2% of the measured ones. gpu_bw never
-                limits anything here, so it's a guess.
+                bandwidth, copy rate, sync cost, and ~2.6 us of GPU time per
+                draw in GPU fast's pipeline that the probes don't explain yet.
 
-The fit was made before the blended classifier existed, and predicted its
-speedups within 4% of what the Wii then measured (MEASURED vs --before).
+The first fit (--before) predicted the blended classifier's speedups within 4%
+of what the Wii then measured. The next round's prediction missed GPU fast by
+17% (51 vs 43.5 tok/s), mostly on the readback's cache misses.
 
 Useful for asking what a change would buy before writing it. Stdlib only.
 """
@@ -37,28 +40,36 @@ import struct
 CPU_HZ, GPU_HZ = 729e6, 243e6
 
 PARAMS = {
-    "cpu_bw": 250e6,     # effective CPU streaming read bandwidth (the 60x bus peaks at 1.9 GB/s)
-    "tev_rate": 486e6,   # TEV pixel-stages per second; each stage also fetches one texel
-    "gpu_bw": 2.5e9,     # GPU texture fetch bandwidth from main memory (a guess; never the limit)
+    "cpu_bw": 250e6,     # effective CPU streaming read bandwidth, as the int8 matmul sees it (MEM1)
+    "tev_rate": 951e6,   # TEV pixel-stages per second when texture fetch keeps up (4 pixels a clock)
+    "gpu_bw": 1.9e9,     # RGBA8 texture fetch from MEM2; it holds the TEV to half its rate
     "copy_rate": 972e6,  # framebuffer-to-RAM copy, pixels per second
     "sync_s": 40e-6,     # one GX_DrawDone round trip
+    "draw_s": 2.6e-6,    # GPU time per small pipelined draw beyond its pixels (fitted to GPU fast; unexplained)
     "ipc": 1.0,          # instructions per cycle for branchy glue code (norms, RoPE, GX calls)
 }
 
-# What the Wii measured (SD:/llama/bench_out.txt, stories15M, 64 greedy tokens, positions 0-63).
-# The fit above was made on the "before" engines: the classifier as 18 clamp8 passes per row.
+# What the Wii measured (SD:/llama/bench_out.txt, stories15M, 64 greedy tokens, positions 0-63): the
+# engines as first run, and now.
 MEASURED_BEFORE = {"CPU": 7.41, "split (GPU classifier + CPU top-64)": 12.29, "GPU, fast (clamp8)": 20.55,
                    "GPU, exact (exact11)": 9.46, "GPU, exact + CPU top-64": 9.41}
-MEASURED = {"CPU": 7.41, "split (GPU classifier + CPU top-256)": 15.34, "GPU, fast (clamp8)": 30.01,
-            "GPU, exact (exact11)": 17.36}  # the current engines, blended classifier
+MEASURED = {"CPU": 7.41, "split (GPU classifier + CPU top-256)": 15.38, "GPU, fast (clamp8)": 43.51,
+            "GPU, exact (exact11)": 20.62}
 
 RESCORE_K = 256      # classifier candidates the CPU recomputes exactly (LlmModel.rescore_k)
 
 INT8_CYC_PER_MAC = 3.0 + 8 / 32
 ATTN_CYC_PER_MAC = 3.5   # q.k has one dependent accumulator; att*v is load/load/store
-READBACK_CYC = 13.0      # per row per pass in clamp8 mode, fitted (cache misses included)
-READBACK_EXACT = 1.4     # exact11 reads two bytes per row and pass
-ISSUE_INSTR = {"clamp8": 3600, "exact11": 2100}  # per pass
+# Readback, all in, fitted to the Wii. Now: framebuffer copies in MEM1, per-group scales in MEM2.
+ROWS_CYC_PER_PIXEL_PASS = 21.0  # GPU fast (sum_pixel): per pixel (3 rows) and pass; ~5 of it instructions
+EXACT_CYC_PER_ROW_PASS = 24.8   # exact11: two bytes, two table lookups and a scale per row and pass
+BLEND_CYC_PER_ROW = 32.4        # the blended output layer: a byte, a row scale and a logit per row
+ROWS_CHUNK = 6                  # passes per framebuffer copy (gx_matmul.c's CHUNK)
+ISSUE_CYC = {"clamp8": 1270, "exact11": 940}  # per pass, raw register writes (probe)
+# Before: copies in MEM2, libogc's setters
+READBACK_CYC = 13.0      # per row and pass, clamp8, plus the copy and scales at cpu_bw
+READBACK_EXACT = 1.4     # exact11 relative to clamp8
+ISSUE_CYC_LIBOGC = {"clamp8": 3600, "exact11": 2100}
 OTHER_INSTR = 2.5e6      # norms, RoPE trig, SiLU, residuals, embedding, greedy argmax
 SAMPLING_INSTR = 5e6     # softmax over the vocab + top-p sort, when temperature > 0
 
@@ -102,8 +113,43 @@ def cpu_matmul_s(mats, p):
     return macs * INT8_CYC_PER_MAC / CPU_HZ + macs / p["cpu_bw"]  # 1 byte of weight per MAC, stalls don't overlap
 
 
-def gpu_matmul_s(mats, mode, p):
-    """Returns (seconds, breakdown) for running `mats` on the TEV, as gx_matmul.c does: synchronously."""
+def pipeline_s(chunks):
+    """
+    One matmul in chunks of (issue, gpu, sum) seconds, the way run_rows overlaps them: the CPU issues
+    chunk c + 1, then waits for chunk c and sums it, while the GPU works through whatever is issued.
+    """
+    cpu, gpu, done = 0.0, 0.0, []
+    for c in range(len(chunks) + 1):
+        if c < len(chunks):
+            cpu += chunks[c][0]
+            gpu = max(gpu, cpu) + chunks[c][1]
+            done.append(gpu)
+        if c > 0:
+            cpu = max(cpu, done[c - 1]) + chunks[c - 1][2]
+    return cpu
+
+
+def rows_matmul_s(mats, p):
+    """(seconds, breakdown) for clamp8 with per-row scales, pipelined (run_rows)."""
+    t = {"issue+sum": 0.0, "waiting": 0.0}
+    for rows, n in mats:
+        pw, ph = region(rows)
+        passes, px = n // 16, pw * ph
+        chunks = []
+        for p0 in range(0, passes, ROWS_CHUNK):
+            k = min(ROWS_CHUNK, passes - p0)
+            gpu = max(k * px * 16 / p["tev_rate"], k * px * 64 / p["gpu_bw"]) + k * px / p["copy_rate"] + k * p["draw_s"]
+            total_sum = ceil_div(rows, 3) * k * ROWS_CYC_PER_PIXEL_PASS / CPU_HZ
+            chunks.append((k * ISSUE_CYC["clamp8"] / CPU_HZ, gpu, total_sum))
+        total = pipeline_s(chunks)
+        busy = sum(c[0] + c[2] for c in chunks)
+        t["issue+sum"] += busy
+        t["waiting"] += total - busy
+    return sum(t.values()), t
+
+
+def gpu_matmul_s(mats, mode, p, before=False):
+    """(seconds, breakdown) for `mats` on the TEV, synchronously: exact11, the blended output layer, or before."""
     cols_per_pass, draws, stages = (8, 2, [8, 11]) if mode == "exact11" else (16, 1, [16])
     t = {"issue": 0.0, "gpu": 0.0, "sync+copy": 0.0, "readback": 0.0}
     for rows, n in mats:
@@ -114,16 +160,19 @@ def gpu_matmul_s(mats, mode, p):
         px = pw * ph
         pixel_stages = passes * px * sum(stages)
         tex_bytes = passes * px * cols_per_pass * 4  # one RGBA8 texel per product stage
-        issue = passes * ISSUE_INSTR["exact11" if mode == "exact11" else "clamp8"] / (p["ipc"] * CPU_HZ)
+        issue = passes * (ISSUE_CYC_LIBOGC if before else ISSUE_CYC)["exact11" if mode == "exact11" else "clamp8"] / CPU_HZ
         gpu = max(pixel_stages / p["tev_rate"], tex_bytes / p["gpu_bw"])
         t["issue"] += issue
         t["gpu"] += max(gpu - issue, 0.0)  # the GPU works through the FIFO while the CPU is still issuing
         if mode == "blend":  # every pass blends into one region: one copy, one byte and one scale per row
             t["sync+copy"] += p["sync_s"] + px / p["copy_rate"]
-            t["readback"] += rows * READBACK_CYC / CPU_HZ + (px * 4 + rows * 4) / p["cpu_bw"]
+            t["readback"] += rows * BLEND_CYC_PER_ROW / CPU_HZ
             continue
         t["sync+copy"] += batches * p["sync_s"] + passes * draws * px / p["copy_rate"]
         row_passes = rows * passes
+        if not before:
+            t["readback"] += row_passes * EXACT_CYC_PER_ROW_PASS / CPU_HZ
+            continue
         mem = passes * draws * px * 4 + rows * passes * 4 * cols_per_pass / 32  # framebuffer copy + scales
         t["readback"] += row_passes * READBACK_CYC * (1 if mode == "clamp8" else READBACK_EXACT) / CPU_HZ + mem / p["cpu_bw"]
     return sum(t.values()), t
@@ -154,9 +203,11 @@ def engine_s(c, engine, p, pos, sampling, before=False):
     if engine.startswith("split"):
         parts["CPU matmuls"] = cpu_matmul_s(layers, p)
         br = {}
+    elif mode == "clamp8" and not before:
+        _, br = rows_matmul_s(layers, p)
     else:
-        _, br = gpu_matmul_s(layers, mode, p)
-    _, brc = gpu_matmul_s(cls, cls_mode, p)
+        _, br = gpu_matmul_s(layers, mode, p, before)
+    _, brc = gpu_matmul_s(cls, cls_mode, p, before)
     for key, v in brc.items():
         br[key] = br.get(key, 0.0) + v
     parts.update({"GPU " + key: v for key, v in br.items()})
@@ -175,7 +226,7 @@ def main():
     ap.add_argument("model", help="llama2.c checkpoint or exported model.bin (only the header is read)")
     ap.add_argument("--pos", type=int, default=32, help="context position to cost attention at (default 32, the bench's average)")
     ap.add_argument("--sampling", action="store_true", help="include temperature sampling (the app's default)")
-    ap.add_argument("--before", action="store_true", help="the engines before the blended classifier (what the fit used)")
+    ap.add_argument("--before", action="store_true", help="the engines as first run on a Wii (what the first fit used)")
     args = ap.parse_args()
 
     c = read_config(args.model)

@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from cost_model import region
 from export_wii import quantize_q8
-from gxmatmul import BlendMatrix, quantize_x
+from gxmatmul import BlendMatrix, TevMatrix, quantize_x, requantize_rows
 from llama import Weights
 from tev import (
     BIAS_ADDHALF,
@@ -46,6 +46,7 @@ from tev import (
 PREV_VALUES = [(77, 150, 200), (-50, 300, 1000), (-1, 256, 511), (0, 255, -1024),
                (1023, -129, 128), (-200, 600, 384), (129, 383, -256), (640, -640, 3)]
 KONST_VALUES = [0, 1, 2, 64, 127, 128, 129, 200, 254, 255]
+CHUNK = 6  # passes per framebuffer copy in gx_matmul.c's run_rows
 BLEND_VALUES = [((10, 100, 200), (20, 100, 100), (5, 250, 0)), ((255, 0, 128), (1, 0, 127), (0, 1, 255)),
                 ((128, 64, 32), (127, 191, 223), (200, 100, 50)), ((0, 0, 0), (0, 255, 1), (1, 255, 0)),
                 ((200, 50, 250), (100, 50, 10), (150, 49, 255)), ((77, 33, 99), (88, 44, 11), (66, 22, 0)),
@@ -60,8 +61,10 @@ def read_probe(path):
     while i < len(data):
         name = data[i:i + 8].rstrip(b"\0").decode()
         w, h = struct.unpack(">II", data[i + 8:i + 16])
-        raw = np.frombuffer(data, np.uint8, w * h * 4, i + 16)
-        out[name] = untile(raw, w, h)
+        if name.endswith("_y"):  # a matmul's float output (gx_probe.c's dump_output)
+            out[name] = np.frombuffer(data, ">f4", w * h, i + 16).astype(np.float32)
+        else:
+            out[name] = untile(np.frombuffer(data, np.uint8, w * h * 4, i + 16), w, h)
         i += 16 + w * h * 4
     return out
 
@@ -77,9 +80,13 @@ def untile(raw, w, h):
 
 
 def matmul_efb(w, x, mode):
-    """The framebuffer bytes gx_matmul.c's first batch should produce, (ph * rows_of_slots, cw, 3)."""
+    """
+    The framebuffer copy gx_matmul.c should leave behind, (ph * rows_of_slots, cw, 3). c8 runs on
+    the per-row-scale twin in chunks, each copied separately with its passes stacked in one column
+    (run_rows), so that's the last chunk; e11 fills the framebuffer row by row in one batch.
+    """
     rows, cols = w.shape
-    q, _, _ = quantize_q8(w, 32)
+    q = requantize_rows(w, 32)[0] if mode == "c8" else quantize_q8(w, 32)[0]
     wu = np.full((-(-rows // 3) * 3, cols), 128, np.int32)
     wu[:rows] = q.reshape(rows, cols).astype(np.int32) + 128
     pw, ph = region(rows)
@@ -94,12 +101,16 @@ def matmul_efb(w, x, mode):
     op = np.where(xs < 0, OP_SUB, OP_ADD)
     bias = np.where(xs < 0, BIAS_ADDHALF, BIAS_SUBHALF)
     draws = 1 if mode == "c8" else 2
-    slots_x = 640 // pw
-    slots = slots_x * (480 // ph)
-    used = min(passes, slots // draws) * draws
+    if mode == "c8":
+        todo, slots_x = list(range((passes - 1) // CHUNK * CHUNK, passes)), 1
+        used = len(todo)
+    else:
+        slots_x = 640 // pw
+        used = min(passes, slots_x * (480 // ph) // draws) * draws
+        todo = list(range(used // draws))
     cw, ch = min(used, slots_x) * pw, -(-used // slots_x) * ph
     efb = np.full((ch, cw, 3), -1, np.int32)  # -1: not drawn
-    for p in range(used // draws):
+    for i, p in enumerate(todo):
         v = np.full((ph, pw, 3), 128 if mode == "c8" else 0, np.int32)
         for k in range(pc):
             v = color_stage(HALF, img[:, :, :, p * pc + k], c[p, k], v, op[p, k], bias[p, k], SCALE_1,
@@ -111,7 +122,7 @@ def matmul_efb(w, x, mode):
             hh = color_stage(K_1_8, 0, 0, hh, OP_ADD, BIAS_ADDHALF, SCALE_DIVIDE2, clamp=True)
             outs.append(to_efb(hh))
         for d, o in enumerate(outs):
-            s = p * draws + d
+            s = i * draws + d
             y0, x0 = (s // slots_x) * ph, (s % slots_x) * pw
             efb[y0:y0 + ph, x0:x0 + pw] = o
     return efb, pw, ph, slots_x
@@ -239,6 +250,15 @@ def main():
                 e, gg = exp[y0:y0 + ph, x0:x0 + pw], g[y0:y0 + ph, x0:x0 + pw]
                 per.append(f"{s}:{int((e != gg).sum())}")
             print("           wrong bytes per slot: " + " ".join(per))
+    for name, mode, headroom, cols in (("w1_c8_y", "clamp8", 0.5, 16), ("w1e11_y", "exact11", 1.0, 8)):
+        if name not in got:
+            continue
+        m = TevMatrix(W.f32[("w1", 0)], mode, headroom, cols, row_scales=mode == "clamp8")
+        exp, g = m(x[: m.n]), got[name]
+        bad = int((exp.view(np.uint32) != g.view(np.uint32)).sum())
+        worst = float(np.max(np.abs(exp - g) / np.maximum(np.abs(exp), 1e-30)))
+        print(f"{name:8s} {'OK' if not bad else 'MISMATCH'}: {bad} of {len(g)} floats differ in any bit"
+              + (f" (worst relative error {worst:.1e})" if bad else ""))
 
 
 if __name__ == "__main__":
