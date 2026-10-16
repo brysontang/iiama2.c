@@ -64,6 +64,7 @@ CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 sFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.S)))
 BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+DSPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.ds)))
 
 #---------------------------------------------------------------------------------
 # use CXX for linking C++ projects, CC for standard C
@@ -74,11 +75,11 @@ else
 	export LD	:=	$(CXX)
 endif
 
-export OFILES_BIN	:=	$(addsuffix .o,$(BINFILES))
+export OFILES_BIN	:=	$(addsuffix .o,$(BINFILES)) $(DSPFILES:.ds=.bin.o)
 export OFILES_SOURCES := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(sFILES:.s=.o) $(SFILES:.S=.o)
 export OFILES := $(OFILES_BIN) $(OFILES_SOURCES)
 
-export HFILES := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+export HFILES := $(addsuffix .h,$(subst .,_,$(BINFILES))) $(DSPFILES:.ds=_bin.h)
 
 #---------------------------------------------------------------------------------
 # build a list of include paths
@@ -133,6 +134,18 @@ $(OFILES_SOURCES) : $(HFILES)
 %.jpg.o	%_jpg.h :	%.jpg
 #---------------------------------------------------------------------------------
 	@echo $(notdir $<)
+	$(bin2o)
+
+#---------------------------------------------------------------------------------
+# DSP microcode (.ds, gcdsptool syntax): assembled, then linked in like any binary,
+# as <name>_bin[] and <name>_bin_size in <name>_bin.h
+#---------------------------------------------------------------------------------
+%.bin : %.ds
+#---------------------------------------------------------------------------------
+	@echo $(notdir $<)
+	@out=$$($(DEVKITPRO)/tools/bin/gcdsptool -c $< -o $@) || { echo "$$out"; rm -f $@; exit 1; }
+
+%.bin.o	%_bin.h :	%.bin
 	$(bin2o)
 
 -include $(DEPENDS)
