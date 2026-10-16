@@ -10,7 +10,7 @@ The Wii does technically have a GPU. Hollywood is fixed-function, with no shader
 
 <sub>The first run on real hardware: stories15M on the CPU engine, on a TV through an HDMI adapter. The GPU engines told garbage stories on that run (the self-test hashes on screen are wrong); see [Dolphin vs a real Wii](#dolphin-vs-a-real-wii) for why.</sub>
 
-**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 59.9 tok/s with stories15M, 4.8x the CPU alone (which got faster too: 12.6 tok/s, up from 7.4). See [Speed](#speed-on-a-real-wii).
+**Status:** runs on a real Wii, where the GPU path matches a bit-exact simulator. The fastest engine does 61.9 tok/s with stories15M (55.7 at the app's default sampling temperature), 4.9x the CPU alone (which got faster too: 12.7 tok/s, up from 7.4). See [Speed](#speed-on-a-real-wii).
 
 ## Quick start
 
@@ -110,18 +110,18 @@ stories15M, 1,154 positions of fp32-sampled stories replayed through each engine
 
 The split engine matches int8 CPU on top-1 and tells the same greedy stories: the true best token was inside the blended output layer's top 64 at all 1,154 positions. KL is higher than int8's because tokens outside the top 256 keep their coarse logits. At the app's sampling settings (temperature 0.8, top-p 0.9), the sampling distribution sits as close to fp32's as int8 CPU's does (total variation 0.012 for both; `tools/tev_sim/blend_sweep.py` has the sampler). GPU-fast stories wander away from the CPU's within a few dozen tokens but stay grammatical. Before its layers got per-row scales, GPU fast scored 91.6% and 0.039.
 
-The engine computes `exp` itself now (see [below](#speed-on-a-real-wii)), and the simulator samples its reference stories with the same softmax, so those stories and their perplexities shifted a little with it (fp32's was 2.77). The int8 KV cache and the 16-bit output layer barely registered either: int8 CPU's KL went from 0.0005 to 0.0007 and GPU fast's from 0.027 to 0.028, and the 16-bit output layer leaves split's numbers where 8-bit textures had them (KL 0.0047 vs 0.0048).
+The engine computes `exp` itself now (see [below](#own-exp-and-a-cheaper-sampler)), and the simulator samples its reference stories with the same softmax, so those stories and their perplexities shifted a little with it (fp32's was 2.77). The int8 KV cache and the 16-bit output layer barely registered either: int8 CPU's KL went from 0.0005 to 0.0007 and GPU fast's from 0.027 to 0.028, and the 16-bit output layer leaves split's numbers where 8-bit textures had them (KL 0.0047 vs 0.0048).
 
 ### Speed on a real Wii
 
-stories15M, int8, the bench's 64-token greedy story (see [below](#running-it-on-a-real-wii)):
+stories15M, int8, the bench's 64-token story, greedy and at the app's default sampling settings (see [below](#running-it-on-a-real-wii)):
 
-| Engine | tok/s | vs CPU |
-|---|---|---|
-| CPU | 12.57 | 1x |
-| split | 25.00 | 2.0x |
-| GPU, fast | 59.89 | 4.8x |
-| GPU, exact | 22.75 | 1.8x |
+| Engine | tok/s, greedy | vs CPU | tok/s, temperature 0.8 |
+|---|---|---|---|
+| CPU | 12.66 | 1x | 12.47 |
+| split | 25.37 | 2.0x | 24.49 |
+| GPU, fast | 61.89 | 4.9x | 55.70 |
+| GPU, exact | 23.05 | 1.8x | 22.32 |
 
 How it got there, one round of changes at a time:
 
@@ -133,28 +133,38 @@ How it got there, one round of changes at a time:
 | 16-bit output layer, int8 KV cache, RoPE once per token | 7.44 | 16.06 | 49.41 | 21.91 |
 | Paired singles for the CPU's int8 matmul and attention, `sqrtf` once per layer | 12.57 | 25.01 | 53.62 | 22.77 |
 | Tall, narrow pass regions for GPU fast's layers | 12.57 | 25.00 | 59.89 | 22.75 |
+| Own `exp` for SiLU and softmax, a sampler without divides | 12.66 | 25.37 | 61.89 | 23.05 |
 
 In between, stacking wq, wk and wv into one GPU matrix, and w1 with w3, cut GPU fast's draws by a third and made it slower (42.6 tok/s): stacked w1|w3 drew in 128x4 regions, 3-4x slower per pixel than w2 in 24x4. That's what sent the probes after region shapes. Stacked in narrow regions it still loses to two separate matmuls, so the engines don't stack.
 
 Where a GPU-fast token's time goes, in ms:
 
-| | now (17 ms) | RGB565 round (20 ms) | GPU fast round (23 ms) | blending (33 ms) | first run (49 ms) |
-|---|---|---|---|---|---|
-| CPU issuing GX commands | 1.7 | 1.7 | 1.7 | 4.7 | 4.6 |
-| CPU waiting for the GPU | 5.1 | 7.5 | 9.7 | 9.6 | 9.9 |
-| CPU reading the framebuffer back and summing passes | 5.1 | 5.0 | 5.0 | 12.9 | 29.0 |
-| Everything else | 4.8 | 6.0 | 6.6 | 6.0 | 5.1 |
+| | now (16 ms) | narrow regions (17 ms) | RGB565 round (20 ms) | GPU fast round (23 ms) | blending (33 ms) | first run (49 ms) |
+|---|---|---|---|---|---|---|
+| CPU issuing GX commands | 1.7 | 1.7 | 1.7 | 1.7 | 4.7 | 4.6 |
+| CPU waiting for the GPU | 5.2 | 5.1 | 7.5 | 9.7 | 9.6 | 9.9 |
+| CPU reading the framebuffer back and summing passes | 5.1 | 5.1 | 5.0 | 5.0 | 12.9 | 29.0 |
+| Everything else | 4.2 | 4.8 | 6.0 | 6.6 | 6.0 | 5.1 |
 
-The bench now profiles every part of a token (`bench_out.txt`, "per token" lines). GPU fast's 16.7 ms:
+The bench also profiles every part of a token (`bench_out.txt`, "per token" lines). GPU fast's 16.2 ms, greedy:
 
 | Part | ms |
 |---|---|
 | Output layer (GPU blend, readback, scales) | 5.78 |
-| Layer matmuls: q/k/v 1.94, wo 0.65, w1/w3 2.84, w2 1.47 | 6.90 |
-| Recomputing the top 256 rows: finding them 0.64, the dot products 0.59 | 1.24 |
-| Attention: q.k 0.35, softmax 0.33, att*v 0.33, quantizing the new k and v 0.25 | 1.26 |
-| SiLU (4,608 `expf` calls) | 1.07 |
-| Sampling, RMSNorm, RoPE, residuals, embedding | 0.45 |
+| Layer matmuls: q/k/v 1.94, wo 0.64, w1/w3 2.90, w2 1.47 | 6.95 |
+| Recomputing the top 256 rows: finding them 0.63, the dot products 0.59 | 1.22 |
+| Attention: q.k 0.35, softmax 0.17, att*v 0.33, quantizing the new k and v 0.25 | 1.10 |
+| SiLU | 0.63 |
+| Sampling (greedy: the top token), RMSNorm, RoPE, residuals, embedding | 0.45 |
+
+#### Own exp and a cheaper sampler
+
+The first sampled bench (`temp 0.8` in `bench.txt`) said the app's default settings ran GPU fast at only 45.7 tok/s: sampling cost 6.0 ms a token, on 32,000 divides by the temperature, 32,000 `expf` calls at about 150 cycles each, and 32,000 more divides to normalize. Two changes brought it to 2.0 ms and 55.7 tok/s:
+
+- **`exp_f`**, the engine's own exp: Cody-Waite range reduction and Cephes' polynomial in plain float adds and multiplies, within 1 ulp. `tools/tev_sim/llama.py` has the same function operation for operation; they agree on 10 million inputs bit for bit, and the bench's `selftest exp` hash shows the Wii agrees too. SiLU and attention's softmax use it as well.
+- **The sampler** works on unnormalized weights e^((l - max) / T): one multiply per logit, `exp` only within 24 of the top logit (about a quarter of the vocab at T 0.8; everything below that never held more than 5.4e-7 of the probability across 300 measured positions), and top-p against `cutoff * sum`. It picks the same tokens as llama2.c's sampler: eight seeded 256-token stories came out identical, and so did the Wii's sampled bench.
+
+`LLM_EXACT_MATMUL` builds keep `expf` and llama2.c's sampler, for comparing with upstream.
 
 The output layer is the biggest piece: 4.3 ms of GPU time where the TEV alone would need 3.2, and it already has the best region shape of 13 tried. The CPU engine spends 46 of its 80 ms on the output layer, so a smaller vocab helps every engine (see the ideas below).
 
@@ -177,12 +187,12 @@ The output layer is the biggest piece: 4.3 ms of GPU time where the TEV alone wo
   | output layer | 116x92 / 108x100 / 128x84 | 5.3 / 5.7 / 24.2 ms |
 
   Layer matrices like being 4 pixels wide. The output layer is the opposite: of 13 widths, 116 was best, and power-of-two widths were 2-5x slower, which looks like the texture cache aliasing. The GPU's performance counters could say for sure, but through libogc only the clock counter reads anything on a Wii.
-- **The audio DSP is free, fast to talk to, and doesn't get in the way.** `source/dsp_probe.c` loads custom microcode (assembled with devkitPro's `gcdsptool`) into the DSP, which runs it at 121.5 MHz. A mailbox round trip from the CPU takes 0.6 µs, and DMA from MEM1 reaches 500 MB/s, faster than the CPU streams it. Neither the CPU's streaming nor the GPU's output layer slowed down while it ran. Its dot-product kernels match the CPU bit for bit in Dolphin but reset the DSP on a real Wii, so that part is still being chased.
+- **The audio DSP is free, fast to talk to, and doesn't get in the way.** `source/dsp_probe.c` loads custom microcode (assembled with devkitPro's `gcdsptool`) into the DSP, which runs it at 121.5 MHz. A mailbox round trip from the CPU takes 0.6 µs, and DMA from MEM1 reaches 500 MB/s, faster than the CPU streams it. Neither the CPU's streaming nor the GPU's output layer slowed down while it ran. On a real Wii its int16 dot products run at 1.16 cycles per multiply-add and int8 (two per word, unpacked) at 2.13, about 57 million a second, matching the CPU's sums. A readback kernel sums framebuffer bytes at 38 row-passes a µs, half the CPU's rate, but gives wrong sums on hardware so far. Getting there took a set of instruction tests, because Dolphin's DSP interpreter differs from the chip: `SI` (store immediate) only reaches hardware registers on a Wii, which first sent the microcode back to its reset vector, and the loop stack is shallower. DMA from MEM2 runs at only 169 MB/s and does slow the GPU a little; the DSP's audio accelerator can stream the weights without DMA, but at 4 cycles a byte.
 - **Locked-cache DMA crashes.** Broadway can lock half its L1 cache as a scratchpad and DMA into it, but on a Wii, libogc's `LCLoadData` ended in a Machine Check exception.
 
 ## Running it on a real Wii
 
-Put an empty `bench.txt` in `SD:/llama/` and the app runs every engine on the same greedy story at boot. It shows tok/s, the GPU time split (issuing, waiting, reading back) and a per-token profile on screen, and writes the same to `SD:/llama/bench_out.txt`. A `steps N` line in `bench.txt` sets the story length (default 64). Delete `bench.txt` to get the normal menu back. To check a bench run against the simulator:
+Put an empty `bench.txt` in `SD:/llama/` and the app runs every engine on the same greedy story at boot. It shows tok/s, the GPU time split (issuing, waiting, reading back) and a per-token profile on screen, and writes the same to `SD:/llama/bench_out.txt`. A `steps N` line in `bench.txt` sets the story length (default 64), and `temp X` runs every engine again sampling at that temperature. Delete `bench.txt` to get the normal menu back. To check a bench run against the simulator:
 
 ```sh
 uv run tools/tev_sim/check_dolphin.py models/stories15M.bin models/tokenizer.bin bench_out.txt
@@ -256,6 +266,7 @@ The GPU path was checked in layers:
 - **The TEV math.** `tools/tev_sim/tev.py` follows the combiner arithmetic in Dolphin's software renderer (`Tev.cpp`). The probes confirmed it on a real Wii: one multiply-add stage for all 256 weight bytes against 10 activation values in both signs, the halving stages, out-of-range writes (they wrap like a u8 cast) and RGB565 texels (they widen to 8 bits by repeating their top bits).
 - **The simulator against Dolphin.** Run in Dolphin, the Wii build's integer outputs match the simulator bit for bit: the pass sums for two matrix shapes in both output modes, and the blended output layer's framebuffer. So do the float outputs of a whole matmul in both modes, down to the last bit, since the simulator rounds the way Broadway's fused multiply-add does. Over 64 greedy tokens, three of the four engines tell the same story as the simulator. GPU fast drifts off after about 20 tokens: it requantizes activations to 8 bits at every layer, so one rounding that goes the other way, from float differences between numpy and C outside the matmuls, gives the rest of the story different quantization noise.
 - **The simulator against a real Wii.** The same integer hashes, probe images and float outputs, bit for bit. The Wii's text output is identical to Dolphin's for all four engines.
+- **The engine's exp against the simulator's.** The bench hashes `exp_f` over 25,600 inputs at boot and `check_dolphin.py` compares the hash with the simulator's: the same in Dolphin and on a Wii.
 - **Paired singles against the scalar loops.** At boot the bench runs both on three real matrices and both attention kernels and compares the floats bit by bit: 0 of 827 differ, in Dolphin and on a Wii.
 - **The simulator against the C engine.** The numpy port in `tools/tev_sim/llama.py` reproduces the C engine's greedy stories exactly, fp32 and int8.
 
@@ -282,8 +293,7 @@ Note that the default build sums each matmul row with 4 accumulators for speed, 
 
 ## Ideas for next steps
 
-- **Put the DSP to work.** It could take a share of the framebuffer readback and of the top-256 recompute while the CPU does the rest, maybe 1-2 ms a token, once its kernels run right on hardware.
-- **A faster exp.** SiLU and softmax spend about 1.4 ms a token in `expf`. A cheaper exp changes the floats, so the simulator has to copy it exactly.
+- **Put the DSP to work.** Its readback kernel, once it's right on hardware, could take about a third of GPU fast's 5 ms of readback while the CPU does the rest, maybe 1.5 ms a token. The catch is numerics: CPU rows and DSP rows have to agree, and the simulator has to follow both, which probably means integer sums with quantized per-pass scales.
 - **Feed the TEV faster.** Even with 16-bit textures, the output layer spends a quarter of its GPU time waiting on texture fetch. The GPU can bulk-load textures into its 1 MB of texture memory ahead of a draw (one output-layer pass is 342 KB), which might let the TEV run at its full rate.
 - **The locked cache, done right.** Locked-cache DMA crashed on a Wii (above). If it can be made to work, double-buffering weights through it could hide the CPU's memory stalls, which `dcbt` can't.
 - **Train your own.** A ~15M model trained on a narrow domain (a grumpy turtle king, say) on a single gaming GPU is more coherent and much funnier than a general one. Use a small vocab while you're at it: on stories15M, the 32000-token output layer is ~60% of the work per token, and a 4096-token vocab (llama2.c's `--vocab_source=custom`) roughly halves it. Export with llama2.c's `export.py --version 0`, then run it through `export_wii.py`.
