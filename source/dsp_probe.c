@@ -5,9 +5,11 @@
 // DSP task API, then measures what we'd need to know before handing the DSP part of a token's work:
 // mailbox round trips, its clock, DMA bandwidth to and from MEM1 and MEM2 (and what DMA traffic does to
 // the CPU's and the GPU's), dot-product kernels and the GPU readback's sums, each checked bit for bit
-// against the CPU. Everything that only needs MEM1 runs before anything touches MEM2. Every wait on the
-// DSP has a timeout; the first one that expires ends the DSP probes. Results go to probe_out.txt as
-// text, nothing to probe.bin.
+// against the CPU. First, though, instruction tests run each form those kernels use once, on known
+// inputs, against what Dolphin's DSP answers, so a real DSP that differs says where. Everything that only
+// needs MEM1 runs before anything touches MEM2. Every wait on the DSP has a timeout, and the microcode
+// reports any exception; the first timeout or exception ends the DSP probes. Results go to probe_out.txt
+// as text, nothing to probe.bin.
 #include "dsp_probe.h"
 
 #include <malloc.h>
@@ -31,7 +33,7 @@
 #define MAIL_UP 0x5ADB0001u
 #define MAIL_DONE 0x5D000000u
 
-enum { OP_NOP, OP_SPIN, OP_DMA, OP_DOT16, OP_DOT8, OP_ACC8, OP_RB };
+enum { OP_NOP, OP_SPIN, OP_DMA, OP_DOT16, OP_DOT8, OP_ACC8, OP_RB, OP_TEST };
 
 // DSP data memory, in words, as laid out in dsp_probe.ds
 #define D_OUTBUF 0x0100
@@ -49,6 +51,8 @@ enum { OP_NOP, OP_SPIN, OP_DMA, OP_DOT16, OP_DOT8, OP_ACC8, OP_RB };
 #define M1_BYTES (256 * 1024)
 #define M2_BYTES (512 * 1024)
 #define OUT_BYTES (64 * 1024)
+#define X_BYTES 2048
+#define TEST_BYTES 512 // the instruction tests' data: 3 x 64 words for the DSP, then 32 bytes for its accelerator
 
 static DspLogFn g_log;
 static int g_dead;      // a wait timed out or the DSP said something unexpected: skip the rest
@@ -63,8 +67,10 @@ static u8 *g_m1, *g_m2;         // scratch carved from the tops of MEM1's and ME
 static void *g_m1_hi, *g_m2_hi; // the arena tops to put back
 static int8_t *g_w8;            // synthetic int8 weights, TEST_ROWS x TEST_N
 static int16_t g_xs[1024];      // activations
-static u16 *g_xbuf;             // x as the DSP loads it
-static u16 *g_out;              // the DSP's results
+static u16 *g_xbuf;             // x as the DSP loads it (MEM1, after g_m1)
+static u16 *g_tdata;            // the instruction tests' data (MEM1)
+static u16 *g_out;              // the DSP's results (MEM1)
+static char g_what[112];        // what the DSP is doing, for error messages
 static u32 g_seed = 12345;
 
 static u32 rnd(void) {
@@ -101,6 +107,30 @@ static int mail_send(u32 mail, u32 timeout_us) {
     return 0;
 }
 
+static const char *const EXC_NAMES[8] = {"reset, or a jump to 0", "stack overflow or underflow", "2",
+                                         "accelerator raw read overflow", "accelerator raw write overflow",
+                                         "accelerator sample read overflow", "6", "CPU interrupt"};
+
+// A mail that isn't the answer: the microcode's exception report (0x5EE0 + vector, then 0x5EE8 with the
+// command's N1, 0x5EE9 with $st0 and 0x5EEA with $st1), the hello of a DSP that ran its entry code again,
+// or anything else. Ends the DSP probes.
+static int unexpected(u32 mail) {
+    u32 hi = mail >> 16;
+    if (hi >= 0x5EE0 && hi <= 0x5EE7) {
+        u32 more[3] = {0, 0, 0};
+        int got = 0;
+        while (got < 3 && !mail_wait(&more[got], T_SHORT)) got++;
+        g_log("dsp: exception %lu (%s) during %s: op %lu, N1 %lu, $st0 %s%04lx, $st1 %s%04lx\n",
+              (unsigned long)(hi - 0x5EE0), EXC_NAMES[hi - 0x5EE0], g_what, (unsigned long)(mail & 0xffff),
+              (unsigned long)(more[0] & 0xffff), got > 1 ? "(where it came from) " : "(not sent) ",
+              (unsigned long)(more[1] & 0xffff), got > 2 ? "(status register then) " : "(not sent) ",
+              (unsigned long)(more[2] & 0xffff));
+        return die("dsp: the microcode halted itself\n");
+    }
+    if (mail == MAIL_UP) return die("dsp: the DSP ran its entry code again (it jumped to 0x0010) during %s\n", g_what);
+    return die("dsp: unexpected mail %08lx during %s\n", (unsigned long)mail, g_what);
+}
+
 // One command: op and its parameter block (addresses a, b, c are physical), timed from the first mail
 // to the answer. cmd_start and cmd_end split it, so the CPU can work while the DSP does.
 static int g_op;
@@ -116,16 +146,20 @@ static int cmd_start(int op, u32 a, u32 b, u32 c, const u16 *n) {
     DCFlushRange(g_params, sizeof(g_params));
     g_op = op;
     g_t0 = gettime();
-    if (mail_send(MAIL_CMD, T_SHORT) || mail_send(PHYS(g_params), T_SHORT))
-        return die("dsp: the DSP didn't take command %d\n", op);
+    if (mail_send(MAIL_CMD, T_SHORT) || mail_send(PHYS(g_params), T_SHORT)) {
+        u32 mail;
+        if (!mail_wait(&mail, 1000)) return unexpected(mail);
+        return die("dsp: the DSP didn't take command %d (%s)\n", op, g_what);
+    }
     return 0;
 }
 
 static int cmd_end(u64 *ticks) {
     u32 mail;
-    if (mail_wait(&mail, T_CMD)) return die("dsp: command %d timed out after %d ms\n", g_op, T_CMD / 1000);
+    if (mail_wait(&mail, T_CMD))
+        return die("dsp: command %d (%s) timed out after %d ms\n", g_op, g_what, T_CMD / 1000);
     u64 t1 = gettime();
-    if (mail != (MAIL_DONE | g_op)) return die("dsp: command %d answered %08lx\n", g_op, (unsigned long)mail);
+    if (mail != (MAIL_DONE | g_op)) return unexpected(mail);
     if (ticks) *ticks = t1 - g_t0;
     return 0;
 }
@@ -168,15 +202,17 @@ static int boot(void) {
     if (mail_wait(&mail, T_SHORT)) return die("dsp: the microcode sent nothing within %d ms\n", T_SHORT / 1000);
     u32 up_us = us_since(t0);
     if (mail != MAIL_UP) return die("dsp: the microcode said %08lx instead of hello\n", (unsigned long)mail);
-    g_log("dsp: boot ROM mailed %04x.... after %lu us; DSP_AddTask took %lu us, the %lu-byte microcode said "
-          "hello after %lu us\n",
-          dmbh, (unsigned long)rom_us, (unsigned long)add_us, (unsigned long)len, (unsigned long)up_us);
+    g_log("dsp: boot ROM mailed %04x.... after %lu us; DSP_AddTask took %lu us, the %lu-byte microcode (from "
+          "%08lx) said hello after %lu us\n",
+          dmbh, (unsigned long)rom_us, (unsigned long)add_us, (unsigned long)len, (unsigned long)(u32)g_ucode,
+          (unsigned long)up_us);
     return 0;
 }
 
 static void probe_mailbox(void) {
     const int n = 1000;
     u64 sum = 0, lo = ~0ull, hi = 0;
+    snprintf(g_what, sizeof(g_what), "the pings");
     for (int i = 0; i < n; i++) {
         u32 mail;
         u64 t0 = gettime();
@@ -186,7 +222,7 @@ static void probe_mailbox(void) {
         }
         u64 dt = gettime() - t0;
         if (mail != (MAIL_PONG | i)) {
-            die("dsp: ping %d answered %08lx\n", i, (unsigned long)mail);
+            unexpected(mail);
             return;
         }
         sum += dt;
@@ -226,6 +262,8 @@ static void probe_clock(void) {
 
 static int dma(u32 main, int block, int blocks, int dir, int passes, u64 *ticks) {
     u16 n[9] = {D_BUF0, (u16)block, (u16)blocks, (u16)dir, (u16)passes};
+    snprintf(g_what, sizeof(g_what), "a DMA of %d x %d bytes %s %08lx", blocks * passes, block, dir ? "to" : "from",
+             (unsigned long)main);
     return run(OP_DMA, main, 0, 0, n, ticks);
 }
 
@@ -378,6 +416,7 @@ static long long result40(const u16 *e) {
 // (int8, read by the accelerator). resident: DOT16/DOT8 DMA one chunk and compute it over and over.
 static void kernel(const char *name, int op, const int8_t *w, const void *src, int rows, int n, int g, int resident) {
     if (g_dead) return;
+    snprintf(g_what, sizeof(g_what), "%s, groups of %d", name, g);
     int ng = n / g, wpr = op == OP_DOT16 ? n : n / 2, rc = 1, rpf = 1;
     if (op == OP_ACC8) { // no chunks; a flush is a multiple of 4 results, and so are all of them
         for (rpf = D_OUT_WORDS / (4 * ng); rpf > 1 && (rpf * ng) % 4; rpf--) {}
@@ -454,6 +493,7 @@ static void kernel(const char *name, int op, const int8_t *w, const void *src, i
 // GB bytes), and for each pixel's R, G and B the sum over passes of (byte - 128) * a 16-bit scale.
 static void readback(int p, int t, int reps, int dma_each) {
     if (g_dead) return;
+    snprintf(g_what, sizeof(g_what), "the readback sums, %d passes", p);
     int bytes = p * t * 64, rows = t * 16 * 3;
     for (int i = 0; i < bytes; i++) g_m1[i] = (u8)rnd();
     for (int i = 0; i < p; i++) g_xbuf[i] = (u16)rnd();
@@ -499,6 +539,206 @@ static u8 *carve(int mem2, u32 bytes, void **old_hi) {
     return p;
 }
 
+// ---- Instruction tests (op 7): each instruction form the kernels use, once, on known inputs. The
+// expected answers are what Dolphin's DSP gives (it runs them all); a real DSP that differs says where.
+// The hex numbers in the names are the hand-encoded words in dsp_probe.ds.
+
+static const char *const TEST_NAMES[] = {
+    "",
+    "DMA'd test data through LRRI and SRRI",
+    "SI to data memory (Dolphin writes 0x0030; the manual says SI only reaches 0xFF00 | M)",
+    "CALLR",
+    "calls and loops 6 deep (3 nested BLOOPs, then LOOP)",
+    "ASR -8 (14f8, 15f8), ASL 8 and 1, LSRNRX 8 (3780)",
+    "ANDR 0xff00 (3400), XORC",
+    "40-bit mode loads to acX.m set .h, clear .l: 'L (8470, 8079), 'LN (847c), LRRI, LRI",
+    "MADDX (e300), MOVP right after it, MADDC (e900, ea00, eb00), a 40-bit product",
+    "dual loads: 'LD (80f0) from banks 2+1 and 0+2, then both from bank 1; 'LDN (80f4)",
+    "int16 kernel words: CLRP'LD (84f0), MADDX'LD (e3f0)",
+    "int8 kernel, pass 1: CLRP'L (8470), ANDR'L (345b), MADDC'L (e970), MADDC (e900)",
+    "int8 kernel, pass 2: NX'L (8079), LSRNRX'L (37d3), MADDC'L (ea79), MADDC (ea00)",
+    "readback words: CLRP'LN (847c), LSRNRX'L (35db), XORC, MADDC'LN (eb7c), ANDR'L (355b), eb00",
+    "the int16 kernel (compute16 via CALLR), 2 rows x 16, groups of 8",
+    "the int8 kernel (compute8 via CALLR), 2 rows x 16, groups of 8",
+    "the readback kernel (rb_compute), 2 passes x 1 tile",
+    "the accelerator: LRS, 'LDN (80f4), CLRP'LDN (84f4), MADDX'LDN (e3f4) reading ACDSAMP",
+};
+#define N_TESTS (int)(sizeof(TEST_NAMES) / sizeof(TEST_NAMES[0]) - 1)
+
+static void put40(u16 *e, long long v) { // as the tests store an accumulator: .h (read sign-extended), .m, .l
+    e[0] = (u16)(int16_t)(int8_t)(v >> 32);
+    e[1] = (u16)(v >> 16);
+    e[2] = (u16)v;
+}
+
+static long long sx(u16 v) { return (int16_t)v; }
+
+// Fills test t's data and parameters (n[0] = N1 ... n[8] = N9) and the answer, word by word (care[i] = 0:
+// don't compare). Returns the number of answer words.
+static int test_setup(int t, u16 *d, u8 *acc, u32 acc_phys, u16 *n, u16 *e, u8 *care) {
+    u16 *d0 = d, *d1 = d + 64, *d2 = d + 128; // at the DSP's 0x0080 (bank 0), XBUF (bank 1), BUF0 (bank 2)
+    for (int k = 0; k < 64; k++) d0[k] = 0x0100 + k, d1[k] = 0x2000 + k, d2[k] = 0x3000 + k;
+    d0[0] = 0x0bee, d0[1] = 0x8123, d0[2] = 0x7abc, d0[3] = 0x4444, d0[8] = 0x9999;
+    d1[0] = 1000, d1[1] = (u16)-2000, d1[2] = 3, d1[3] = 11;
+    d2[0] = 0xa5c3, d2[1] = 0x3c5a, d2[2] = 7, d2[3] = (u16)-5;
+    for (int k = 0; k < 32; k++) acc[k] = (u8)(k * 29 + 3);
+    acc[0] = 0x80, acc[1] = 0x7f;
+    memset(care, 1, 96);
+    n[0] = (u16)t;
+    n[8] = 64; // result bytes
+    switch (t) {
+    case 1:
+        e[0] = 0x1234, e[1] = d0[0], e[2] = d1[0], e[3] = d2[0];
+        return 4;
+    case 2:
+        e[0] = 0x5157;
+        return 1;
+    case 3:
+        e[0] = 0xc1, e[1] = 0xc2;
+        return 2;
+    case 4:
+        e[0] = 3 * 4 * (5 + 2);
+        return 1;
+    case 5:
+        put40(e, 0x123456);
+        put40(e + 3, 0x1234567800LL);
+        put40(e + 6, 0x2468acf000LL);
+        put40(e + 9, -(1LL << 23));
+        put40(e + 12, 0xa5c3000000LL - (1LL << 40));
+        return 15;
+    case 6:
+        e[0] = 0xa500, e[1] = 0x9234;
+        return 2;
+    case 7: {
+        static const u16 w[18] = {0xffff, 0x8123, 0, 0, 0x7abc, 0, 0x82, 0x83, 0, 0x4444, 0, 0x88,
+                                  0xffff, 0x9999, 0, 0xffff, 0x8000, 0};
+        memcpy(e, w, sizeof(w));
+        return 18;
+    }
+    case 8:
+        put40(e, -2100);
+        put40(e + 3, -4200);
+        put40(e + 6, -3000);
+        put40(e + 9, 15000 - 150);
+        put40(e + 12, 1LL << 32);
+        return 15;
+    case 9: {
+        u16 w[14] = {d2[0], d1[0], 0x801, 0x401, d0[0], d2[0], 0x81, 0x801, d1[0], d1[0], d2[2], d1[2], 0x802, 0x403};
+        memcpy(e, w, sizeof(w));
+        return 14;
+    }
+    case 10:
+        put40(e, sx(d2[2]) * sx(d1[2]) + sx(d2[3]) * sx(d1[3]));
+        e[3] = 0x804, e[4] = 0x404;
+        return 5;
+    case 11: {
+        long long a = sx(d2[0] & 0xff00) * sx(d1[0]);
+        put40(e, a);
+        e[3] = d2[1];
+        put40(e + 4, a + sx(d2[1] & 0xff00) * sx(d1[1]));
+        e[7] = 0x802, e[8] = 0x402;
+        return 9;
+    }
+    case 12: {
+        unsigned long long v = ((unsigned long long)sx(d2[0]) << 24) & 0xffffffffffULL; // 'L, then << 8
+        put40(e, (long long)(v ^ 0x8000000000ULL) - (long long)0x8000000000ULL);
+        put40(e + 3, sx((u16)(d2[0] << 8)) * sx(d1[0]) + sx((u16)(d2[1] << 8)) * sx(d1[1]));
+        e[6] = 0x802, e[7] = 0x402;
+        return 8;
+    }
+    case 13:
+        e[0] = d2[2], e[1] = 0x804;
+        put40(e + 2, sx((u16)(d2[0] << 8) ^ 0x8000) * sx(d1[0]));
+        e[5] = 0x9800;
+        put40(e + 6, sx(0x9800) * sx(d1[1]));
+        return 9;
+    case 14:
+    case 15: { // 2 rows x 16 columns, groups of 8
+        int8_t w[32];
+        int16_t x[16];
+        for (int k = 0; k < 32; k++) w[k] = (int8_t)(k * 37 + 11);
+        w[0] = -128, w[1] = 127;
+        for (int k = 0; k < 16; k++) x[k] = (int16_t)(k * 4099 - 30000);
+        x[0] = -32768, x[1] = 32767;
+        for (int k = 0; k < 16; k++) d1[k] = (u16)x[k];
+        if (t == 14) {
+            for (int k = 0; k < 32; k++) d2[k] = (u16)(int16_t)w[k];
+        } else {
+            for (int k = 0; k < 16; k++) d2[k] = (u16)((u8)w[2 * k] << 8 | (u8)w[2 * k + 1]);
+            for (int q = 0; q < 2; q++) // each group's even columns, then its odd ones
+                for (int j = 0; j < 4; j++) d1[q * 8 + j] = (u16)x[q * 8 + 2 * j], d1[q * 8 + 4 + j] = (u16)x[q * 8 + 2 * j + 1];
+        }
+        n[1] = 0, n[2] = 2, n[3] = 2, n[7] = t == 14 ? 7 : 3; // offset, rows, groups, inner loop count
+        for (int r = 0; r < 2; r++)
+            for (int q = 0; q < 2; q++) {
+                long long s = 0;
+                for (int j = 0; j < 8; j++) s += (long long)w[r * 16 + q * 8 + j] * x[q * 8 + j];
+                put40(e + (r * 2 + q) * 4, t == 14 ? s : 256 * s);
+                care[(r * 2 + q) * 4 + 3] = 0; // the gap word
+            }
+        return 16;
+    }
+    case 16: { // 2 passes of one tile: 16 pixels' AR words, then their GB words
+        for (int k = 0; k < 64; k++) d2[k] = (u16)rnd();
+        d1[0] = (u16)rnd(), d1[1] = 0x8000;
+        n[1] = 1, n[4] = 1, n[5] = 32, n[8] = 192; // tiles, passes - 1, words between passes, result bytes
+        for (int r = 0; r < 48; r++) {
+            int pix = r / 3, c = r % 3;
+            long long s = 0;
+            for (int p = 0; p < 2; p++) {
+                u16 ar = d2[p * 32 + pix], gb = d2[p * 32 + 16 + pix];
+                int b = c == 0 ? ar & 0xff : c == 1 ? gb >> 8 : gb & 0xff;
+                s += (long long)(b - 128) * sx(d1[p]);
+            }
+            e[2 * r] = (u16)((u32)s >> 16), e[2 * r + 1] = (u16)s;
+        }
+        return 96;
+    }
+    case 17: {
+        u32 end = acc_phys + 32 + 64;
+        n[2] = (u16)(end >> 16), n[4] = (u16)end;
+        e[0] = (u16)(acc[0] << 8), e[1] = (u16)(acc[1] << 8);
+        e[2] = (u16)(acc[2] << 8), e[3] = d1[0], e[4] = 0xffdd, e[5] = 0x401;
+        put40(e + 6, sx((u16)(acc[3] << 8)) * sx(d1[1]) + sx((u16)(acc[4] << 8)) * sx(d1[2]));
+        e[9] = 0xffdd, e[10] = 0x403;
+        return 11;
+    }
+    }
+    return 0;
+}
+
+static void probe_tests(void) {
+    g_log("probe: DSP instruction tests (the answers are Dolphin's)\n");
+    u16 *d = g_tdata;
+    u8 *acc = (u8 *)(g_tdata + 192);
+    for (int t = 1; t <= N_TESTS && !g_dead; t++) {
+        u16 n[9] = {0}, e[96];
+        u8 care[96];
+        int words = test_setup(t, d, acc, PHYS(acc), n, e, care);
+        DCFlushRange(d, TEST_BYTES);
+        memset(g_out, 0xee, 256);
+        DCFlushRange(g_out, 256);
+        snprintf(g_what, sizeof(g_what), "test %d (%s)", t, TEST_NAMES[t]);
+        if (run(OP_TEST, PHYS(acc), PHYS(d), PHYS(g_out), n, NULL)) return;
+        DCInvalidateRange(g_out, 256);
+        int bad = 0, len = 0;
+        char detail[128] = "";
+        for (int i = 0; i < words; i++) {
+            if (!care[i] || g_out[i] == e[i]) continue;
+            if (bad++ < 4 && len < (int)sizeof(detail) - 40)
+                len += snprintf(detail + len, sizeof(detail) - len, " word %d is %04x, not %04x;", i, g_out[i], e[i]);
+        }
+        if (!bad) {
+            g_log("dsp: test %2d OK: %s\n", t, TEST_NAMES[t]);
+            continue;
+        }
+        g_log("dsp: test %2d WRONG in %d of %d words: %s:%s\n", t, bad, words, TEST_NAMES[t], detail);
+        if (t == 2 && g_out[0] == 0x0bad) g_log("dsp: so SI stores only to hardware registers, as the manual says\n");
+        if (t == 9 && (g_out[8] != e[8] || g_out[9] != e[9]))
+            g_log("dsp: (words 8-9 are two loads from one bank, where Dolphin gives both the first address's word)\n");
+    }
+}
+
 // Everything that only touches MEM1 runs before anything touches MEM2, in case the DSP can't reach it.
 static void sections(LlmModel *m) {
     // synthetic weights and x, with the extremes: row 0 all 127, row 1 all -128, x starting with -32768s
@@ -512,6 +752,8 @@ static void sections(LlmModel *m) {
     const u8 *cpu = m->dtype == LLM_DTYPE_Q8 ? (const u8 *)m->cls.q : (const u8 *)m->cls.f;
     size_t cpu_bytes = (size_t)m->c.vocab_size * m->c.dim * (m->dtype == LLM_DTYPE_Q8 ? 1 : 4);
     char what[64];
+
+    probe_tests();
 
     g_log("probe: DSP DMA, MEM1\n");
     dma_check(g_m1, g_m1 + 4096, 0);
@@ -569,15 +811,23 @@ void dsp_probe_run(LlmModel *m, DspLogFn log) {
     g_log = log;
     g_dead = 0;
     log("probe: DSP boot\n");
-    g_m1 = carve(0, M1_BYTES, &g_m1_hi);
+    snprintf(g_what, sizeof(g_what), "the boot");
+    // everything the DSP reads or writes before the MEM2 section is in MEM1
+    g_m1 = carve(0, M1_BYTES + X_BYTES + TEST_BYTES + OUT_BYTES, &g_m1_hi);
     g_m2 = carve(1, M2_BYTES, &g_m2_hi);
     g_w8 = (int8_t *)malloc(TEST_ROWS * TEST_N);
-    g_xbuf = (u16 *)memalign(32, 2048);
-    g_out = (u16 *)memalign(32, OUT_BYTES);
-    if (!g_m1 || !g_m2 || !g_w8 || !g_xbuf || !g_out) {
+    if (g_m1) {
+        g_xbuf = (u16 *)(g_m1 + M1_BYTES);
+        g_tdata = (u16 *)(g_m1 + M1_BYTES + X_BYTES);
+        g_out = (u16 *)(g_m1 + M1_BYTES + X_BYTES + TEST_BYTES);
+    }
+    if (!g_m1 || !g_m2 || !g_w8) {
         log("dsp: out of memory\n");
     } else if (!boot()) {
-        log("dsp: scratch at %08lx (MEM1) and %08lx (MEM2)\n", (unsigned long)(u32)g_m1, (unsigned long)(u32)g_m2);
+        log("dsp: scratch at %08lx (MEM1: weights, then x at %08lx, test data at %08lx, results at %08lx) and %08lx "
+            "(MEM2)\n",
+            (unsigned long)(u32)g_m1, (unsigned long)(u32)g_xbuf, (unsigned long)(u32)g_tdata,
+            (unsigned long)(u32)g_out, (unsigned long)(u32)g_m2);
         log("probe: DSP mailbox\n");
         probe_mailbox();
         log("probe: DSP clock\n");
@@ -595,11 +845,9 @@ void dsp_probe_run(LlmModel *m, DspLogFn log) {
     if (g_m2) SYS_SetArena2Hi(g_m2_hi);
     if (g_m1) SYS_SetArena1Hi(g_m1_hi);
     free(g_w8);
-    free(g_xbuf);
-    free(g_out);
     free(g_ucode);
     g_m1 = g_m2 = NULL;
     g_w8 = NULL;
-    g_xbuf = g_out = NULL;
+    g_xbuf = g_out = g_tdata = NULL;
     g_ucode = NULL;
 }

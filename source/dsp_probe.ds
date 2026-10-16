@@ -6,7 +6,9 @@
  *   0x0C0D0000, addr   command: DMAs the 32-byte parameter block at physical address addr into
  *                      PARAMS, runs operation P_OP, answers 0x5D00 << 16 | op
  *   0x48540000         halt: answers 0x5D0000FF, then stops
- * It answers 0x5ADB0001 once it's up, and 0x5EEExxxx for anything it doesn't know.
+ * It answers 0x5ADB0001 once it's up, and 0x5EEExxxx for anything it doesn't know. Every exception
+ * vector (0 included: a jump to address 0 lands there too) mails 0x5EE0 + vector : op,
+ * 0x5EE8 : the op's N1, 0x5EE9 : $st0 (where it came from), 0x5EEA : $st1, and halts.
  *
  * Register names are gcdsptool's: $acc0 is $ac0, $acx0 is $ax0, $status is $sr. gcdsptool encodes the
  * dual-load extended opcodes ('LD and friends) and the right-shift immediates differently from the
@@ -15,6 +17,10 @@
  *
  * Data memory: four 1K-word banks. Dual loads ('LD) must read two different banks (on the same bank
  * both registers get the first address's word), so x lives in bank 1 and the weights in banks 2-3.
+ *
+ * SI only stores to hardware registers: on a real DSP it writes 0xFF00 | M, whatever M is (Dolphin's
+ * interpreter sign-extends M, so there it can also write data memory 0x0000-0x007F; the first version of
+ * this microcode relied on that and jumped to 0 on a Wii). Data memory is written with SR/SRRI.
  */
 
 /* hardware registers */
@@ -68,26 +74,25 @@ V_CH:		equ	0x0024	/* chunks (or repeats) left */
 V_CUR:		equ	0x0025	/* weight buffer being computed */
 V_OPTR:		equ	0x0026	/* next free word of OUTBUF */
 V_FN:		equ	0x0027	/* the dot driver's compute routine */
+V_EXC:		equ	0x0028	/* set while an exception is being reported */
+V_OPN:		equ	0x0029	/* the current command's op and N1, for exception reports */
+V_TST:		equ	0x002a
+V_SCR:		equ	0x0030	/* scratch word for the SI test */
+T_D0:		equ	0x0080	/* the tests' data: 64 words here, at XBUF and at BUF0 */
 OUTBUF:		equ	0x0100	/* results, flushed to main memory by DMA (bank 0) */
 XBUF:		equ	0x0400	/* activations or per-pass scales (bank 1) */
 BUF0:		equ	0x0800	/* weight buffers (banks 2 and 3) */
 BUF1:		equ	0x0c00
 
-/* exception vectors, two words each */
-	jmp	entry		/* reset */
-	jmp	fatal		/* stack overflow */
-	rti
-	nop
-	rti			/* accelerator raw read overflow */
-	nop
-	rti			/* accelerator raw write overflow */
-	nop
-	rti			/* accelerator sample read overflow */
-	nop
-	rti
-	nop
-	rti			/* CPU interrupt */
-	nop
+/* exception vectors, two words each; all report and halt (see exc_report) */
+	jmp	exc0		/* reset, or a jump to 0 */
+	jmp	exc1		/* stack overflow or underflow */
+	jmp	exc2
+	jmp	exc3		/* accelerator raw read overflow */
+	jmp	exc4		/* accelerator raw write overflow */
+	jmp	exc5		/* accelerator sample read overflow */
+	jmp	exc6
+	jmp	exc7		/* CPU interrupt */
 
 /* 0x0010: libogc's task loader jumps here (init_vec) */
 entry:
@@ -99,6 +104,10 @@ entry:
 	lri	$wr3, #0xffff
 	clr	$acc0
 	clr	$acc1
+	lri	$acx0.l, #0
+	sr	@V_EXC, $acx0.l
+	sr	@V_OPN, $acx0.l
+	sr	@V_TST, $acx0.l
 	lri	$acx1.h, #0x5adb
 	lri	$acx1.l, #0x0001
 	call	send_mail
@@ -128,9 +137,70 @@ do_halt:
 	call	send_mail
 	halt
 
-fatal:
-	si	@I_DMBH, #0x5eee
-	si	@I_DMBL, #0xdead
+exc0:
+	lri	$acx1.h, #0x5ee0
+	jmp	exc_report
+exc1:
+	lri	$acx1.h, #0x5ee1
+	jmp	exc_report
+exc2:
+	lri	$acx1.h, #0x5ee2
+	jmp	exc_report
+exc3:
+	lri	$acx1.h, #0x5ee3
+	jmp	exc_report
+exc4:
+	lri	$acx1.h, #0x5ee4
+	jmp	exc_report
+exc5:
+	lri	$acx1.h, #0x5ee5
+	jmp	exc_report
+exc6:
+	lri	$acx1.h, #0x5ee6
+	jmp	exc_report
+exc7:
+	lri	$acx1.h, #0x5ee7
+
+/* No calls here (the stacks may be what broke), and a second exception while reporting just halts. */
+exc_report:
+	clr	$acc0
+	lr	$acc0.m, @V_EXC
+	cmpi	$acc0.m, #0
+	jne	exc_halt
+	lri	$acx0.l, #1
+	sr	@V_EXC, $acx0.l
+	lr	$acx1.l, @V_OPN
+ex_wait1:
+	lr	$acc0.m, @I_DMBH
+	andcf	$acc0.m, #0x8000
+	jlz	ex_wait1
+	sr	@I_DMBH, $acx1.h
+	sr	@I_DMBL, $acx1.l
+	lri	$acx1.h, #0x5ee8
+	lr	$acx1.l, @V_TST
+ex_wait2:
+	lr	$acc0.m, @I_DMBH
+	andcf	$acc0.m, #0x8000
+	jlz	ex_wait2
+	sr	@I_DMBH, $acx1.h
+	sr	@I_DMBL, $acx1.l
+	lri	$acx1.h, #0x5ee9
+	mrr	$acx1.l, $st0
+ex_wait3:
+	lr	$acc0.m, @I_DMBH
+	andcf	$acc0.m, #0x8000
+	jlz	ex_wait3
+	sr	@I_DMBH, $acx1.h
+	sr	@I_DMBL, $acx1.l
+	lri	$acx1.h, #0x5eea
+	mrr	$acx1.l, $st1
+ex_wait4:
+	lr	$acc0.m, @I_DMBH
+	andcf	$acc0.m, #0x8000
+	jlz	ex_wait4
+	sr	@I_DMBH, $acx1.h
+	sr	@I_DMBL, $acx1.l
+exc_halt:
 	halt
 
 /* A command: the second mail is the parameter block's address. */
@@ -143,6 +213,10 @@ do_cmd:
 	si	@I_DSCR, #0x0000
 	call	dma_go
 	call	dma_wait
+	lr	$acx0.l, @P_OP
+	sr	@V_OPN, $acx0.l
+	lr	$acx0.l, @P_N1
+	sr	@V_TST, $acx0.l
 	clr	$acc0
 	lr	$acc0.m, @P_OP
 	cmpi	$acc0.m, #0
@@ -159,6 +233,8 @@ do_cmd:
 	jeq	op_acc8
 	cmpi	$acc0.m, #6
 	jeq	op_rb
+	cmpi	$acc0.m, #7
+	jeq	op_test
 	lri	$acx1.h, #0x5eee
 	mrr	$acx1.l, $acc0.m
 	call	send_mail
@@ -292,11 +368,12 @@ dmab_pass_end:
    (the first chunk only, computed N1 times), N6 = OUTBUF address at which to flush, N7 = x bytes,
    N8 = inner loop count. Each result is 4 words: $acc0.h, .m, .l of the 40-bit sum, and a gap. ---- */
 op_dot16:
-	si	@V_FN, #compute16
+	lri	$acx0.l, #compute16
 	jmp	dot_drive
 op_dot8:
-	si	@V_FN, #compute8
+	lri	$acx0.l, #compute8
 dot_drive:
+	sr	@V_FN, $acx0.l
 	call	load_x
 	lr	$acx0.h, @P_AH
 	sr	@V_WH, $acx0.h
@@ -305,8 +382,8 @@ dot_drive:
 	call	init_out
 	lr	$acx0.h, @P_N1
 	sr	@V_CH, $acx0.h
-	si	@V_CUR, #BUF0
 	lri	$acx1.h, #BUF0
+	sr	@V_CUR, $acx1.h
 	call	w_dma_start
 dd_loop:
 	call	dma_wait
@@ -366,7 +443,8 @@ init_out:
 	sr	@V_OH, $acx0.h
 	lr	$acx0.l, @P_CL
 	sr	@V_OL, $acx0.l
-	si	@V_OPTR, #OUTBUF
+	lri	$acx0.l, #OUTBUF
+	sr	@V_OPTR, $acx0.l
 	ret
 
 /* Starts the next weight chunk's DMA (N9 + 32 bytes) into DSP address $acx1.h and advances V_W by N9. */
@@ -412,7 +490,8 @@ fo_len_ok:
 	addaxl	$acc0, $acx1.l
 	sr	@V_OH, $acc0.m
 	sr	@V_OL, $acc0.l
-	si	@V_OPTR, #OUTBUF
+	lri	$acx0.l, #OUTBUF
+	sr	@V_OPTR, $acx0.l
 	ret
 
 flush_tail:
@@ -510,23 +589,7 @@ c8_row_end:
 op_acc8:
 	call	load_x
 	call	init_out
-	si	@I_FMT, #0x0019		/* 8-bit PCM from memory, gain scale 1 */
-	si	@I_GAIN, #0x0100
-	si	@I_PRED, #0x0000
-	si	@I_COEF0, #0x0000
-	si	@I_COEF1, #0x0000
-	si	@I_YN1, #0x0000
-	lr	$acx0.h, @P_AH
-	sr	@I_ACSAH, $acx0.h
-	sr	@I_ACCAH, $acx0.h
-	lr	$acx0.l, @P_AL
-	sr	@I_ACSAL, $acx0.l
-	sr	@I_ACCAL, $acx0.l
-	lr	$acx0.h, @P_N3
-	sr	@I_ACEAH, $acx0.h
-	lr	$acx0.l, @P_N5
-	sr	@I_ACEAL, $acx0.l
-	si	@I_YN2, #0x0000
+	call	acc_setup
 	lri	$ar0, #I_ACDSAMP
 	lri	$ix0, #0
 	lri	$ix1, #XBUF
@@ -563,6 +626,27 @@ a8_row_end:
 	sr	@V_OPTR, $ar2
 	call	flush_tail
 	jmp	op_done
+
+/* The accelerator reads 8-bit PCM from A (byte address) to N3:N5 with gain 256 and no prediction. */
+acc_setup:
+	si	@I_FMT, #0x0019		/* 8-bit PCM from memory, gain scale 1 */
+	si	@I_GAIN, #0x0100
+	si	@I_PRED, #0x0000
+	si	@I_COEF0, #0x0000
+	si	@I_COEF1, #0x0000
+	si	@I_YN1, #0x0000
+	lr	$acx0.h, @P_AH
+	sr	@I_ACSAH, $acx0.h
+	sr	@I_ACCAH, $acx0.h
+	lr	$acx0.l, @P_AL
+	sr	@I_ACSAL, $acx0.l
+	sr	@I_ACCAL, $acx0.l
+	lr	$acx0.h, @P_N3
+	sr	@I_ACEAH, $acx0.h
+	lr	$acx0.l, @P_N5
+	sr	@I_ACEAL, $acx0.l
+	si	@I_YN2, #0x0000		/* starts it */
+	ret
 
 /* ---- op 6: the GPU readback's sums. A = N1 passes of N2 framebuffer-copy tiles (4x4 RGBA8 pixels,
    32 AR bytes then 32 GB bytes), N6 words apart; B = one 16-bit scale per pass; C = results.
@@ -675,3 +759,434 @@ rb_store:
 	srri	@$ar2, $acc1.l
 	s40
 	ret
+
+/* ---- op 7: instruction tests, one per command, to find what a real DSP does differently from Dolphin.
+   N1 = test; B = 384 bytes, DMA'd to T_D0, XBUF and BUF0 (64 words each); C = results: N9 bytes from
+   OUTBUF. A and N2-N8 as the test needs. dsp_probe.c knows what each one should answer. ---- */
+op_test:
+	lr	$acx0.h, @P_BH
+	lr	$acx0.l, @P_BL
+	lri	$acx1.h, #T_D0
+	call	t_load
+	lri	$acx1.h, #XBUF
+	call	t_load
+	lri	$acx1.h, #BUF0
+	call	t_load
+	lri	$status, #0x2000
+	clr	$acc0
+	clr	$acc1
+	lri	$acx0.h, #0
+	lri	$acx0.l, #0
+	lri	$acx1.h, #0
+	lri	$acx1.l, #0
+	lri	$ix0, #0
+	lri	$ix1, #0
+	lri	$ix2, #0
+	lri	$ix3, #0
+	lri	$ar2, #OUTBUF
+	lr	$acc0.m, @P_N1
+	cmpi	$acc0.m, #1
+	jeq	t_dram
+	cmpi	$acc0.m, #2
+	jeq	t_si
+	cmpi	$acc0.m, #3
+	jeq	t_callr
+	cmpi	$acc0.m, #4
+	jeq	t_nest
+	cmpi	$acc0.m, #5
+	jeq	t_shift
+	cmpi	$acc0.m, #6
+	jeq	t_logic
+	cmpi	$acc0.m, #7
+	jeq	t_ld40
+	cmpi	$acc0.m, #8
+	jeq	t_mul
+	cmpi	$acc0.m, #9
+	jeq	t_dual
+	cmpi	$acc0.m, #10
+	jeq	t_k16f
+	cmpi	$acc0.m, #11
+	jeq	t_k8a
+	cmpi	$acc0.m, #12
+	jeq	t_k8b
+	cmpi	$acc0.m, #13
+	jeq	t_rbf
+	cmpi	$acc0.m, #14
+	jeq	t_c16
+	cmpi	$acc0.m, #15
+	jeq	t_c8
+	cmpi	$acc0.m, #16
+	jeq	t_rbc
+	cmpi	$acc0.m, #17
+	jeq	t_acc
+t_end:
+	lri	$status, #0x2000
+	lr	$acx0.h, @P_CH
+	lr	$acx0.l, @P_CL
+	lri	$acx1.h, #OUTBUF
+	lr	$acx1.l, @P_N9
+	si	@I_DSCR, #0x0001
+	call	dma_go
+	call	dma_wait
+	jmp	op_done
+
+/* 128 bytes from main memory $acx0.h:$acx0.l to DSP address $acx1.h; advances $acx0 past them. */
+t_load:
+	lri	$acx1.l, #128
+	si	@I_DSCR, #0x0000
+	call	dma_go
+	call	dma_wait
+	clr	$acc1
+	mrr	$acc1.m, $acx0.h
+	mrr	$acc1.l, $acx0.l
+	addaxl	$acc1, $acx1.l
+	mrr	$acx0.h, $acc1.m
+	mrr	$acx0.l, $acc1.l
+	ret
+
+t_st0:
+	srri	@$ar2, $acc0.h
+	srri	@$ar2, $acc0.m
+	srri	@$ar2, $acc0.l
+	ret
+t_st1:
+	srri	@$ar2, $acc1.h
+	srri	@$ar2, $acc1.m
+	srri	@$ar2, $acc1.l
+	ret
+t_stx:
+	srri	@$ar2, $acx0.h
+	srri	@$ar2, $acx1.h
+	srri	@$ar2, $ar0
+	srri	@$ar2, $ar3
+	ret
+
+/* 1: the DMA'd words read back through LRRI, and SRRI */
+t_dram:
+	lri	$acx0.l, #0x1234
+	srri	@$ar2, $acx0.l
+	lri	$ar0, #T_D0
+	lrri	$acx0.l, @$ar0
+	srri	@$ar2, $acx0.l
+	lri	$ar0, #XBUF
+	lrri	$acx0.l, @$ar0
+	srri	@$ar2, $acx0.l
+	lri	$ar0, #BUF0
+	lrri	$acx0.l, @$ar0
+	srri	@$ar2, $acx0.l
+	jmp	t_end
+
+/* 2: SI to data memory: Dolphin writes 0x0030, the manual says a DSP writes 0xFF30 */
+t_si:
+	lri	$acx0.l, #0x0bad
+	sr	@V_SCR, $acx0.l
+	si	@V_SCR, #0x5157
+	lr	$acx0.l, @V_SCR
+	srri	@$ar2, $acx0.l
+	jmp	t_end
+
+/* 3: CALLR */
+t_callr:
+	lri	$ar1, #t_callr_sub
+	callr	$ar1
+	srri	@$ar2, $acx0.l
+	lri	$acx0.l, #0x00c2
+	srri	@$ar2, $acx0.l
+	jmp	t_end
+t_callr_sub:
+	lri	$acx0.l, #0x00c1
+	ret
+
+/* 4: six calls and loops deep (BLOOP, BLOOP, BLOOP; then LOOP), counting 3 * 4 * (5 + 2) */
+t_nest:
+	clr	$acc0			/* the dispatch left the test number in it */
+	lri	$acx0.l, #3
+	lri	$acx1.l, #4
+	lri	$ix2, #5
+	lri	$ix3, #2
+	call	tn_1
+	srri	@$ar2, $acc0.m
+	jmp	t_end
+tn_1:
+	call	tn_2
+	ret
+tn_2:
+	bloop	$acx0.l, tn_e1
+	bloop	$acx1.l, tn_e2
+	call	tn_3
+tn_e2:
+	nop
+tn_e1:
+	nop
+	ret
+tn_3:
+	bloop	$ix2, tn_e3
+	nop
+tn_e3:
+	incm	$acc0.m
+	loop	$ix3
+	incm	$acc0.m
+	ret
+
+/* 5: shifts: ASR by 8 (both accumulators), ASL 8 and 1, LSRNRX by 8 */
+t_shift:
+	lri	$acc0.m, #0x1234
+	lri	$acc0.l, #0x5678
+	cw	0x14f8			/* asr $acc0, #-8 */
+	call	t_st0
+	clr	$acc0
+	lri	$acc0.m, #0x1234
+	lri	$acc0.l, #0x5678
+	asl	$acc0, #8
+	call	t_st0
+	asl	$acc0, #1
+	call	t_st0
+	clr	$acc1
+	lri	$acc1.h, #0x00ff
+	lri	$acc1.m, #0x8000
+	cw	0x15f8			/* asr $acc1, #-8 */
+	call	t_st1
+	clr	$acc1
+	lri	$acc1.m, #0xa5c3
+	lri	$acx1.h, #8
+	cw	0x3780			/* lsrnrx $acc1, $ax1.h */
+	call	t_st1
+	jmp	t_end
+
+/* 6: ANDR with 0xff00, XORC */
+t_logic:
+	lri	$acc0.m, #0xa5c3
+	lri	$acx0.h, #0xff00
+	cw	0x3400			/* andr $ac0.m, $ax0.h */
+	srri	@$ar2, $acc0.m
+	lri	$acc0.m, #0x8000
+	lri	$acc1.m, #0x1234
+	xorc	$acc1.m, $acc0.m
+	srri	@$ar2, $acc1.m
+	jmp	t_end
+
+/* 7: in 40-bit mode, loads to $acX.m sign-extend into .h and clear .l: 'L, 'LN, LRRI, LRI */
+t_ld40:
+	lri	$acc0.h, #0x000f
+	lri	$acc0.l, #0x5555
+	lri	$acc1.h, #0x0012
+	lri	$acc1.m, #0x3333
+	lri	$acc1.l, #0x5555
+	lri	$ar0, #0x0081
+	lri	$ar1, #0x0082
+	s40
+	cw	0x8470			/* clrp'l : $ac0.m, @$ar0 */
+	cw	0x8079			/* nx'l : $ac1.m, @$ar1 */
+	s16
+	call	t_st0
+	call	t_st1
+	srri	@$ar2, $ar0
+	srri	@$ar2, $ar1
+	clr	$acc1
+	lri	$acc1.h, #0x0003
+	lri	$acc1.l, #0x5555
+	lri	$ar0, #0x0083
+	lri	$ix0, #5
+	s40
+	cw	0x847c			/* clrp'ln : $ac1.m, @$ar0 */
+	s16
+	call	t_st1
+	srri	@$ar2, $ar0
+	clr	$acc0
+	lri	$acc0.h, #0x0007
+	lri	$acc0.l, #0x5555
+	clr	$acc1
+	lri	$acc1.l, #0x5555
+	lri	$ar0, #0x0088
+	s40
+	lrri	$acc0.m, @$ar0
+	lri	$acc1.m, #0x8000
+	s16
+	call	t_st0
+	call	t_st1
+	jmp	t_end
+
+/* 8: MADDX with MOVP right after (and after a NOP), MADDC in its three forms, a 40-bit product */
+t_mul:
+	lri	$acx0.h, #300
+	lri	$acx1.h, #0xfff9
+	cw	0x8400			/* clrp */
+	cw	0xe300			/* maddx $ax0.h, $ax1.h */
+	movp	$acc0
+	call	t_st0
+	cw	0xe300
+	nop
+	movp	$acc0
+	call	t_st0
+	clr	$acc0
+	lri	$acc0.m, #1000
+	lri	$acx1.h, #0xfffd
+	cw	0x8400
+	cw	0xe900			/* maddc $ac0.m, $ax1.h */
+	movp	$acc1
+	call	t_st1
+	clr	$acc1
+	lri	$acc1.m, #50
+	cw	0x8400
+	cw	0xea00			/* maddc $ac1.m, $ax0.h */
+	cw	0xeb00			/* maddc $ac1.m, $ax1.h */
+	movp	$acc0
+	call	t_st0
+	lri	$acx0.h, #0x8000
+	lri	$acx1.h, #0x8000
+	cw	0x8400
+	cw	0xe300
+	cw	0xe300
+	cw	0xe300
+	cw	0xe300
+	movp	$acc0
+	call	t_st0
+	jmp	t_end
+
+/* 9: dual loads: 'LD from banks 2 and 1, 0 and 2, then both in bank 1; 'LDN with $ix0 = 0 */
+t_dual:
+	lri	$ar0, #BUF0
+	lri	$ar3, #XBUF
+	cw	0x80f0			/* nx'ld : $ax0.h, $ax1.h, @$ar0 */
+	call	t_stx
+	lri	$ar0, #T_D0
+	lri	$ar3, #BUF0
+	cw	0x80f0
+	call	t_stx
+	lri	$ar0, #XBUF
+	lri	$ar3, #0x0401
+	cw	0x80f0
+	srri	@$ar2, $acx0.h
+	srri	@$ar2, $acx1.h
+	lri	$ar0, #0x0802
+	lri	$ix0, #0
+	lri	$ar3, #0x0402
+	cw	0x80f4			/* nx'ldn : $ax0.h, $ax1.h, @$ar0 */
+	call	t_stx
+	jmp	t_end
+
+/* 10: the int16 kernel's words, once each */
+t_k16f:
+	lri	$ar0, #0x0802
+	lri	$ar3, #0x0402
+	cw	0x84f0			/* clrp'ld : $ax0.h, $ax1.h, @$ar0 */
+	cw	0xe3f0			/* maddx'ld $ax0.h, $ax1.h : $ax0.h, $ax1.h, @$ar0 */
+	cw	0xe300			/* maddx $ax0.h, $ax1.h */
+	movp	$acc0
+	call	t_st0
+	srri	@$ar2, $ar0
+	srri	@$ar2, $ar3
+	jmp	t_end
+
+/* 11: the int8 kernel's first pass, two words */
+t_k8a:
+	lri	$ar0, #BUF0
+	lri	$ar3, #XBUF
+	lri	$acx0.h, #0xff00
+	s40
+	cw	0x8470			/* clrp'l : $ac0.m, @$ar0 */
+	cw	0x345b			/* andr'l $ac0.m, $ax0.h : $ax1.h, @$ar3 */
+	cw	0xe970			/* maddc'l $ac0.m, $ax1.h : $ac0.m, @$ar0 */
+	movp	$acc1
+	s16
+	call	t_st1
+	srri	@$ar2, $acc0.m
+	s40
+	cw	0x345b
+	cw	0xe900			/* maddc $ac0.m, $ax1.h */
+	movp	$acc1
+	s16
+	call	t_st1
+	srri	@$ar2, $ar0
+	srri	@$ar2, $ar3
+	jmp	t_end
+
+/* 12: the int8 kernel's second pass, two words */
+t_k8b:
+	lri	$ar1, #BUF0
+	lri	$ar3, #XBUF
+	lri	$acx1.h, #8
+	cw	0x8400			/* clrp */
+	s40
+	cw	0x8079			/* nx'l : $ac1.m, @$ar1 */
+	cw	0x37d3			/* lsrnrx'l $acc1, $ax1.h : $ax0.h, @$ar3 */
+	s16
+	call	t_st1
+	s40
+	cw	0xea79			/* maddc'l $ac1.m, $ax0.h : $ac1.m, @$ar1 */
+	cw	0x37d3
+	cw	0xea00			/* maddc $ac1.m, $ax0.h */
+	movp	$acc0
+	s16
+	call	t_st0
+	srri	@$ar2, $ar1
+	srri	@$ar2, $ar3
+	jmp	t_end
+
+/* 13: the readback kernel's words */
+t_rbf:
+	lri	$ar0, #BUF0
+	lri	$ix0, #2
+	lri	$ar3, #XBUF
+	lri	$acx0.h, #8
+	s40
+	lri	$acc0.m, #0x8000
+	cw	0x847c			/* clrp'ln : $ac1.m, @$ar0 */
+	cw	0x35db			/* lsrnrx'l $acc1, $ax0.h : $ax1.h, @$ar3 */
+	xorc	$acc1.m, $acc0.m
+	cw	0xeb7c			/* maddc'ln $ac1.m, $ax1.h : $ac1.m, @$ar0 */
+	s16
+	srri	@$ar2, $acc1.m
+	srri	@$ar2, $ar0
+	movp	$acc1
+	call	t_st1
+	lri	$acx0.h, #0xff00
+	s40
+	lri	$acc1.m, #0x9876
+	cw	0x355b			/* andr'l $ac1.m, $ax0.h : $ax1.h, @$ar3 */
+	cw	0x8400			/* clrp */
+	cw	0xeb00			/* maddc $ac1.m, $ax1.h */
+	movp	$acc0
+	s16
+	srri	@$ar2, $acc1.m
+	call	t_st0
+	jmp	t_end
+
+/* 14-16: the real kernels on a few rows: compute16 and compute8 through CALLR as the driver calls them,
+   rb_compute */
+t_c16:
+	lri	$ar1, #compute16
+	jmp	t_ckern
+t_c8:
+	lri	$ar1, #compute8
+t_ckern:
+	lri	$acx0.l, #BUF0
+	sr	@V_CUR, $acx0.l
+	lri	$acx0.l, #OUTBUF
+	sr	@V_OPTR, $acx0.l
+	callr	$ar1
+	jmp	t_end
+t_rbc:
+	call	rb_compute
+	jmp	t_end
+
+/* 17: the accelerator: LRS from ACDSAMP, then 'LDN, CLRP'LDN and MADDX'LDN reading it */
+t_acc:
+	call	acc_setup
+	lrs	$acc0.m, @I_ACDSAMP
+	srri	@$ar2, $acc0.m
+	lrs	$acc0.m, @I_ACDSAMP
+	srri	@$ar2, $acc0.m
+	lri	$ar0, #I_ACDSAMP
+	lri	$ix0, #0
+	lri	$ar3, #XBUF
+	cw	0x80f4			/* nx'ldn : $ax0.h, $ax1.h, @$ar0 */
+	call	t_stx
+	cw	0x84f4			/* clrp'ldn : $ax0.h, $ax1.h, @$ar0 */
+	cw	0xe3f4			/* maddx'ldn $ax0.h, $ax1.h : $ax0.h, $ax1.h, @$ar0 */
+	cw	0xe300			/* maddx $ax0.h, $ax1.h */
+	movp	$acc0
+	call	t_st0
+	srri	@$ar2, $ar0
+	srri	@$ar2, $ar3
+	jmp	t_end
