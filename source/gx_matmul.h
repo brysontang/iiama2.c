@@ -21,20 +21,24 @@ int gxm_reserve(void); // before loading the model: a small framebuffer-copy buf
 int gxm_init(void);
 void gxm_set_mode(int out_mode, float headroom);
 
-// Uploads one matrix (must be int8 with a group size that's a multiple of 16). Returns a handle for
-// LlmMatrix.gpu, or NULL if it's unsupported or memory ran out (llm_error() says which).
+// Uploads one layer matrix on its own (must be int8 with a group size that's a multiple of 16). Returns a
+// handle for LlmMatrix.gpu, or NULL if it's unsupported or memory ran out (llm_error() says which).
+// gxm_free frees one.
 void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols);
+void gxm_free(void *gpu);
 // Uploads the classifier, then (if `layers`) every layer matrix. Sets m->gpu_matmul.
 // Returns 0 if everything asked for was uploaded. The classifier is uploaded blended: one weight scale
 // per row and every pass summed in the framebuffer, so its logits are coarse (8 bits per row) and
-// meant for LlmModel.rescore_k. gxm_set_mode doesn't apply to it.
+// meant for LlmModel.rescore_k. gxm_set_mode doesn't apply to it. wq, wk, wv go up stacked into one
+// matrix (LlmLayer.gpu_qkv), and so do w1, w3 (gpu_w13), or one by one if a stack doesn't fit.
 int gxm_upload_model(LlmModel *m, int layers, size_t *bytes);
 
 void gxm_matmul(void *gpu, float *xout, const float *x); // an LlmGpuMatmulFn
 
 // Bit-exactness check against tools/tev_sim: FNV-1a over every pass's integer sum
-// (row-major, int16 little-endian) for input x. For the blended classifier, each row's whole sum.
-uint32_t gxm_partials_hash(void *gpu, const float *x);
+// (row-major, int16 little-endian) for input x, for the first `rows` rows: all of them, or a stack's
+// first matrix. For the blended classifier, each row's whole sum.
+uint32_t gxm_partials_hash(void *gpu, const float *x, int rows);
 
 // For gx_probe.c: the latest framebuffer copy (RGBA8 tiles, w x h pixels), a way to say the TEV
 // setup was changed behind gx_matmul.c's back, and a switch between writing the per-pass GPU

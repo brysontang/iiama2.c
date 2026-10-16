@@ -382,12 +382,14 @@ static void run_bench(LlmModel *m, LlmTokenizer *t, const char *root) {
         for (int j = 0; j < n; j++) x[j] = (float)(((j * 37) % 101) - 50) / 16.0f;
         static const struct { int mode; float headroom; const char *name; } checks[] = {
             {GXM_CLAMP8, 0.5f, "clamp8"}, {GXM_EXACT11, 1.0f, "exact11"}};
-        report("selftest blend: cls %08lx\n", (unsigned long)gxm_partials_hash(m->cls.gpu, x));
+        LlmLayer *L = &m->layers[0];
+        void *w1 = L->gpu_w13 ? L->gpu_w13 : L->w1.gpu; // stacked, w1's rows come first
+        report("selftest blend: cls %08lx\n", (unsigned long)gxm_partials_hash(m->cls.gpu, x, m->c.vocab_size));
         for (int i = 0; i < 2 && g_gpu_layers; i++) {
             gxm_set_mode(checks[i].mode, checks[i].headroom);
             report("selftest %s headroom %.2f: w1 %08lx w2 %08lx\n", checks[i].name, checks[i].headroom,
-                   (unsigned long)gxm_partials_hash(m->layers[0].w1.gpu, x),
-                   (unsigned long)gxm_partials_hash(m->layers[0].w2.gpu, x));
+                   (unsigned long)gxm_partials_hash(w1, x, m->c.hidden_dim),
+                   (unsigned long)gxm_partials_hash(L->w2.gpu, x, m->c.dim));
         }
         if (gxm_tokens_failed()) report("warning: GPU draw-sync tokens timed out; matmuls fell back to GX_DrawDone\n");
         free(x);

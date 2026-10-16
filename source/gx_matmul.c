@@ -14,6 +14,8 @@
 // saturates less and lets the readback skip the scales (run_rows, sum_pixel).
 // The classifier is different: its passes all blend into the same pixels, so the
 // framebuffer does the summing and the CPU reads one byte per row (run_blend).
+// Layer matrices that multiply the same x (wq, wk, wv and w1, w3) go up stacked, as
+// one matrix, so each group is one draw per pass instead of two or three (Stack).
 
 #include "gx_matmul.h"
 
@@ -60,7 +62,24 @@ typedef struct GxMat {
     int fmt;            // texel format: GX_TF_RGBA8, or GX_TF_RGB565 for the blended output layer
     float *srow;        // SCALES_ROW and SCALES_BLEND: per-row scales (3 * npx, zero past the last row)
     struct GxMat *per_row; // a layer matrix's SCALES_ROW twin, which clamp8 runs on
+    size_t bytes;       // textures and scales, as counted in g_bytes
 } GxMat;
+
+// The model's matrices that make up one GPU matrix: one, or several with the same columns whose rows are
+// stacked in order. Every output row depends only on its own weights and x (each pass quantizes x the same
+// way for all of them), so a stack gives each row exactly the result it gets on its own.
+typedef struct {
+    int n, rows[3];
+    const LlmMatrix *w[3];
+} Stack;
+
+// Row `row` of a stack: its int8 weights, and its group scales in *s.
+static const int8_t *stack_row(const Stack *w, int row, int cols, int gs, const float **s) {
+    int i = 0;
+    while (row >= w->rows[i]) row -= w->rows[i++];
+    *s = w->w[i]->s + (size_t)row * (cols / gs);
+    return w->w[i]->q + (size_t)row * cols;
+}
 
 static int g_ready;
 static int g_mode = GXM_CLAMP8;
@@ -207,18 +226,21 @@ static uint8_t rgb565_code(int b, int bits) {
 
 // Texture byte for (row, col): the CPU's int8 weight + 128, or the weight requantized with one scale
 // per row. Must match requantize_rows in tools/tev_sim/gxmatmul.py exactly.
-static uint8_t wu(const GxMat *g, const LlmMatrix *w, int row, int col) {
+static uint8_t wu(const GxMat *g, const Stack *w, int row, int col) {
     if (row >= g->rows) return 128;
-    size_t i = (size_t)row * g->cols + col;
-    if (g->kind == SCALES_GROUP) return (uint8_t)(w->q[i] + 128);
-    float v = (float)w->q[i] * w->s[i / g->gs];
+    const float *ws;
+    const int8_t *wq = stack_row(w, row, g->cols, g->gs, &ws);
+    if (g->kind == SCALES_GROUP) return (uint8_t)(wq[col] + 128);
+    float v = (float)wq[col] * ws[col / g->gs];
     float s = g->srow[row] == 0.0f ? 1.0f : g->srow[row];
     int q = (int)rintf(v / s);
     q = q > 127 ? 127 : q < -127 ? -127 : q;
     return (uint8_t)(q + 128);
 }
 
-static GxMat *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, int kind) {
+static GxMat *upload(const LlmModel *m, const Stack *w, int cols, int kind) {
+    int rows = 0;
+    for (int i = 0; i < w->n; i++) rows += w->rows[i];
     if (m->dtype != LLM_DTYPE_Q8 || m->gs % 16 || cols % 16 || cols / 8 > MAX_PASSES) {
         llm_set_error("the GPU path needs int8 weights with a group size that's a multiple of 16");
         return NULL;
@@ -266,19 +288,19 @@ static GxMat *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, 
         free(g);
         return NULL;
     }
-    if (per_row) {
-        for (int r = 0; r < rows; r++) {
-            float amax = 0.0f;
-            for (int c = 0; c < cols; c++) {
-                size_t i = (size_t)r * cols + c;
-                float v = fabsf((float)w->q[i] * w->s[i / g->gs]);
-                if (v > amax) amax = v;
-            }
-            g->srow[r] = amax / 127.0f;
+    for (int r = 0; r < rows; r++) {
+        const float *ws;
+        const int8_t *wq = stack_row(w, r, cols, g->gs, &ws);
+        if (!per_row) {
+            for (int k = 0; k < groups; k++) g->st[(size_t)k * padded_rows + r] = ws[k];
+            continue;
         }
-    } else {
-        for (int r = 0; r < rows; r++)
-            for (int k = 0; k < groups; k++) g->st[(size_t)k * padded_rows + r] = w->s[(size_t)r * groups + k];
+        float amax = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            float v = fabsf((float)wq[c] * ws[c / g->gs]);
+            if (v > amax) amax = v;
+        }
+        g->srow[r] = amax / 127.0f;
     }
 
     uint8_t c5[256], c6[256];
@@ -315,20 +337,34 @@ static GxMat *upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols, 
         GX_InitTexObjFilterMode(&g->obj[t], GX_NEAR, GX_NEAR);
     }
     GX_InvalidateTexAll();
-    g_bytes += (size_t)g->tex_bytes * g->ntex + nscales * sizeof(float);
+    g->bytes = (size_t)g->tex_bytes * g->ntex + nscales * sizeof(float);
+    g_bytes += g->bytes;
     return g;
-}
-
-void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
-    return upload(m, w, rows, cols, SCALES_GROUP);
 }
 
 // A layer matrix: per-group textures for exact11, and a per-row twin for clamp8. Without memory for
 // the twin, clamp8 runs on the per-group textures instead.
-static GxMat *upload_layer(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
-    GxMat *g = upload(m, w, rows, cols, SCALES_GROUP);
-    if (g) g->per_row = upload(m, w, rows, cols, SCALES_ROW);
+static GxMat *upload_layer(const LlmModel *m, const Stack *w, int cols) {
+    GxMat *g = upload(m, w, cols, SCALES_GROUP);
+    if (g) g->per_row = upload(m, w, cols, SCALES_ROW);
     return g;
+}
+
+void *gxm_upload(const LlmModel *m, const LlmMatrix *w, int rows, int cols) {
+    Stack one = {1, {rows}, {w}};
+    return upload_layer(m, &one, cols);
+}
+
+void gxm_free(void *gpu) {
+    GxMat *g = (GxMat *)gpu;
+    if (!g) return;
+    gxm_free(g->per_row);
+    g_bytes -= g->bytes;
+    free(g->tex);
+    free(g->obj);
+    free(g->st);
+    free(g->srow);
+    free(g);
 }
 
 int gxm_upload_model(LlmModel *m, int layers, size_t *bytes) {
@@ -336,14 +372,23 @@ int gxm_upload_model(LlmModel *m, int layers, size_t *bytes) {
     int dim = c->dim, hid = c->hidden_dim, kv = c->dim * c->n_kv_heads / c->n_heads;
     m->gpu_matmul = gxm_matmul;
     int rc = 0;
-    if (!m->cls.gpu && !(m->cls.gpu = upload(m, &m->cls, c->vocab_size, dim, SCALES_BLEND))) rc = -1;
+    Stack cls = {1, {c->vocab_size}, {&m->cls}};
+    if (!m->cls.gpu && !(m->cls.gpu = upload(m, &cls, dim, SCALES_BLEND))) rc = -1;
     for (int l = 0; rc == 0 && layers && l < c->n_layers; l++) {
         LlmLayer *L = &m->layers[l];
-        struct { LlmMatrix *w; int rows, cols; } mats[7] = {
-            {&L->wq, dim, dim}, {&L->wk, kv, dim}, {&L->wv, kv, dim}, {&L->wo, dim, dim},
-            {&L->w1, hid, dim}, {&L->w2, dim, hid}, {&L->w3, hid, dim}};
-        for (int i = 0; i < 7 && rc == 0; i++)
-            if (!mats[i].w->gpu && !(mats[i].w->gpu = upload_layer(m, mats[i].w, mats[i].rows, mats[i].cols))) rc = -1;
+        // wq, wk, wv multiply the same x, and so do w1, w3: each group goes up stacked, or if that doesn't
+        // fit, one matrix at a time
+        Stack qkv = {3, {dim, kv, kv}, {&L->wq, &L->wk, &L->wv}}, w13 = {2, {hid, hid}, {&L->w1, &L->w3}};
+        if (!L->gpu_qkv && !L->wq.gpu) L->gpu_qkv = upload_layer(m, &qkv, dim);
+        if (!L->gpu_w13 && !L->w1.gpu) L->gpu_w13 = upload_layer(m, &w13, dim);
+        struct { LlmMatrix *w; int rows, cols; void *stack; } mats[7] = {
+            {&L->wq, dim, dim, L->gpu_qkv}, {&L->wk, kv, dim, L->gpu_qkv}, {&L->wv, kv, dim, L->gpu_qkv},
+            {&L->wo, dim, dim, NULL},       {&L->w1, hid, dim, L->gpu_w13}, {&L->w2, dim, hid, NULL},
+            {&L->w3, hid, dim, L->gpu_w13}};
+        for (int i = 0; i < 7 && rc == 0; i++) {
+            Stack one = {1, {mats[i].rows}, {mats[i].w}};
+            if (!mats[i].stack && !mats[i].w->gpu && !(mats[i].w->gpu = upload_layer(m, &one, mats[i].cols))) rc = -1;
+        }
     }
     if (bytes) *bytes = g_bytes;
     return rc;
@@ -734,6 +779,10 @@ static void run(GxMat *g, float *xout, const float *x) {
     int passes = g->cols / pc, tex_per_pass = pc / PLANES;
     int slots_x = EFB_W / g->pw, slots = slots_x * (EFB_H / g->ph);
     int per_batch = slots / draws;
+    // Batches small enough for their copy to fit in g_hot, if a row of slots does: reading a copy from MEM2
+    // costs more than another sync. (A stacked w1, w3 takes two batches in exact11.)
+    int hot = g_hot ? HOT_BYTES / (slots_x * g->pw * g->ph * 4) * slots_x / draws : 0;
+    if (hot > 0 && hot < per_batch) per_batch = hot;
 
     load_layout(g_mode);
     if (xout) memset(xout, 0, g->rows * sizeof(float));
@@ -785,14 +834,15 @@ static void run(GxMat *g, float *xout, const float *x) {
 
 void gxm_matmul(void *gpu, float *xout, const float *x) { run((GxMat *)gpu, xout, x); }
 
-uint32_t gxm_partials_hash(void *gpu, const float *x) {
+uint32_t gxm_partials_hash(void *gpu, const float *x, int rows) {
     GxMat *g = (GxMat *)gpu;
     int passes = g->kind == SCALES_BLEND ? 1 : g->cols / (g_mode == GXM_CLAMP8 ? 16 : 8); // blended: one sum per row
     g_partials = (int16_t *)calloc((size_t)g->rows * passes, sizeof(int16_t));
     if (!g_partials) return 0;
     run(g, NULL, x);
     uint32_t h = 2166136261u;
-    for (size_t i = 0; i < (size_t)g->rows * passes; i++) {
+    size_t n = (size_t)(rows < g->rows ? rows : g->rows) * passes; // row-major, so a stack's first part comes first
+    for (size_t i = 0; i < n; i++) {
         uint16_t v = (uint16_t)g_partials[i];
         h = (h ^ (v & 0xff)) * 16777619u;
         h = (h ^ (v >> 8)) * 16777619u;
